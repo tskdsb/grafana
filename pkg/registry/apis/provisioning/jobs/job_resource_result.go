@@ -1,10 +1,31 @@
 package jobs
 
 import (
+	"errors"
+
 	"github.com/grafana/grafana/apps/provisioning/pkg/repository"
 	"github.com/grafana/grafana/pkg/registry/apis/provisioning/resources"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// warningErrors is a map of errors that should be treated as warnings instead of errors.
+// This map will grow over time as more error types are identified that should be warnings.
+var warningErrors = []error{
+	resources.ErrParse,
+}
+
+// isWarningError checks if the given error should be treated as a warning.
+func isWarningError(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, warningErr := range warningErrors {
+		if errors.Is(err, warningErr) {
+			return true
+		}
+	}
+	return false
+}
 
 // JobResourceResult represents the result of a resource operation in a job.
 type JobResourceResult struct {
@@ -102,8 +123,15 @@ func (b *jobResourceResultBuilder) WithAction(action repository.FileAction) *job
 }
 
 // WithError sets the error associated with the resource operation.
+// If the error is classified as a warning error, it will be set as a warning instead of an error.
 func (b *jobResourceResultBuilder) WithError(err error) *jobResourceResultBuilder {
-	b.result.err = err
+	if err != nil && isWarningError(err) {
+		b.result.warning = err
+		b.result.err = nil
+	} else {
+		b.result.err = err
+		b.result.warning = nil
+	}
 	return b
 }
 

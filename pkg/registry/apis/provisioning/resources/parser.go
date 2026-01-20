@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path"
 
@@ -27,6 +28,8 @@ import (
 	"github.com/grafana/grafana/pkg/infra/tracing"
 	"github.com/grafana/grafana/pkg/util"
 )
+
+var ErrParse = errors.New("resource parse error")
 
 // ParserFactory is a factory for creating parsers for a given repository
 //
@@ -144,7 +147,7 @@ func (r *parser) Parse(ctx context.Context, info *repository.FileInfo) (parsed *
 		logger.Debug("failed to find GVK of the input data, trying fallback loader", "error", err)
 		parsed.Obj, gvk, parsed.Classic, err = ReadClassicResource(ctx, info)
 		if err != nil || gvk == nil {
-			return nil, apierrors.NewBadRequest("unable to read file as a resource")
+			return nil, fmt.Errorf("unable to read file as a resource: %w", ErrParse)
 		}
 	}
 
@@ -172,7 +175,7 @@ func (r *parser) Parse(ctx context.Context, info *repository.FileInfo) (parsed *
 
 	// Validate the namespace
 	if obj.GetNamespace() != "" && obj.GetNamespace() != r.repo.Namespace {
-		return nil, apierrors.NewBadRequest("the file namespace does not match target namespace")
+		return nil, fmt.Errorf("the file namespace does not match target namespace: %w", ErrParse)
 	}
 	obj.SetNamespace(r.repo.Namespace)
 

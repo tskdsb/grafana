@@ -46,7 +46,7 @@ func TestParser(t *testing.T) {
 			Data: []byte("hello"), // not a real resource
 		})
 		require.Error(t, err)
-		require.Equal(t, "unable to read file as a resource", err.Error())
+		require.Equal(t, "unable to read file as a resource: resource parse error", err.Error())
 	})
 
 	t.Run("dashboard parsing (with and without name)", func(t *testing.T) {
