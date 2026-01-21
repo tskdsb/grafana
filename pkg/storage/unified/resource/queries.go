@@ -153,19 +153,29 @@ func (qb *queryBuilder) buildBatchDeleteQuery(keyPaths []string) (string, []inte
 }
 
 // buildInsertDatastoreQuery generates INSERT for datastore section for use in non-backwards compatible mode (without rvmanager)
-// Includes guid, key_path, value
+// Includes all 8 fields with empty string defaults for group, resource, namespace, name, and 0 for action
 func (qb *queryBuilder) buildInsertDatastoreQuery(keyPath string, value []byte, guid string) (string, []interface{}) {
 	query := fmt.Sprintf(
-		"INSERT INTO %s (%s, %s, %s) VALUES (%s, %s, %s)",
+		"INSERT INTO %s (%s, %s, %s, %s, %s, %s, %s, %s) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
 		qb.dialect.QuoteIdent(qb.tableName),
 		qb.dialect.QuoteIdent("guid"),
 		qb.dialect.QuoteIdent("key_path"),
 		qb.dialect.QuoteIdent("value"),
+		qb.dialect.QuoteIdent("group"),
+		qb.dialect.QuoteIdent("resource"),
+		qb.dialect.QuoteIdent("namespace"),
+		qb.dialect.QuoteIdent("name"),
+		qb.dialect.QuoteIdent("action"),
 		qb.dialect.Placeholder(1), // guid
 		qb.dialect.Placeholder(2), // key_path
 		qb.dialect.Placeholder(3), // value
+		qb.dialect.Placeholder(4), // group (empty)
+		qb.dialect.Placeholder(5), // resource (empty)
+		qb.dialect.Placeholder(6), // namespace (empty)
+		qb.dialect.Placeholder(7), // name (empty)
+		qb.dialect.Placeholder(8), // action (0)
 	)
-	return query, []interface{}{guid, keyPath, value}
+	return query, []interface{}{guid, keyPath, value, "", "", "", "", 0}
 }
 
 // buildInsertDatastoreBackwardCompatQuery generates minimal INSERT for backward-compatible mode
