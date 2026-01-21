@@ -30,7 +30,7 @@ func TestMain(m *testing.M) {
 	testsuite.Run(m)
 }
 
-// testMode represents a feature flag configuration for testing
+// testMode groups feature toggles needed for different test scenarios
 type testMode struct {
 	name           string
 	featureToggles []string
@@ -42,8 +42,8 @@ func getTestModes() []testMode {
 		{name: "legacy", featureToggles: nil},
 		{name: "k8s-reroute", featureToggles: []string{
 			"datasourcesRerouteLegacyCRUDAPIs",
-			"queryService",                // Required for QueryAPI registration
-			"queryServiceWithConnections", // Required for connections endpoint
+			"queryService",                // need query.grafana.app API group
+			"queryServiceWithConnections", // need query.grafana.app connections subresource
 		}},
 	}
 }
@@ -55,6 +55,7 @@ func TestIntegrationDataSourceGetByUID(t *testing.T) {
 
 	for _, mode := range getTestModes() {
 		t.Run(mode.name, func(t *testing.T) {
+			// set up Grafana and a database
 			dir, path := testinfra.CreateGrafDir(t, testinfra.GrafanaOpts{
 				DisableAnonymous:     true,
 				EnableFeatureToggles: mode.featureToggles,
@@ -72,11 +73,13 @@ func TestIntegrationDataSourceGetByUID(t *testing.T) {
 // runGetTests runs all GET endpoint tests
 func runGetTests(t *testing.T, ctx context.Context, grafanaListeningAddr string, testEnv *server.TestEnv, store db.DB, cfg *setting.Cfg, modePrefix string) {
 	t.Run("GET - succeeds", func(t *testing.T) {
+		// make a unique-enough UID - all the tests in this file share the same grafana instance.
 		uid := fmt.Sprintf("%s-prometheus-get", modePrefix)
 		jsonData := simplejson.NewFromAny(map[string]any{
 			"httpMethod": "POST",
-			"customKey":  "customValue",
 		})
+
+		// populate as many fields as possible so we can check them for equality in the response.
 		_, err := testEnv.Server.HTTPServer.DataSourcesService.AddDataSource(ctx,
 			&datasources.AddDataSourceCommand{
 				OrgID:         1,
@@ -131,10 +134,7 @@ func runGetTests(t *testing.T, ctx context.Context, grafanaListeningAddr string,
 		require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	})
 
-	// Note: Resource-scoped permission tests are skipped in k8s-reroute mode because
-	// K8s APIs use a different authorization model (RBAC) that doesn't support
-	// Grafana's fine-grained resource permissions (e.g., datasources:read:uid:specific-uid).
-	// Role-based access (Admin, Editor, Viewer) works correctly in both modes.
+	// TODO: support resource-scoped tests against the k8s-reroute path (currently they give 403)
 	if modePrefix == "legacy" {
 		t.Run("GET - specific UID scope granted", func(t *testing.T) {
 			dsUID := fmt.Sprintf("%s-ds-get-perms-0", modePrefix)
@@ -159,6 +159,7 @@ func runGetTests(t *testing.T, ctx context.Context, grafanaListeningAddr string,
 		})
 	}
 
+	// TODO: support wildcard resource-scoped tests against the k8s-reroute path (currently they give 403)
 	if modePrefix == "legacy" {
 		t.Run("GET - wildcard UID scope granted", func(t *testing.T) {
 			dsUID := fmt.Sprintf("%s-ds-get-perms-1", modePrefix)
@@ -175,33 +176,14 @@ func runGetTests(t *testing.T, ctx context.Context, grafanaListeningAddr string,
 
 			login := fmt.Sprintf("%s-user-get-1", modePrefix)
 			password := "testpass"
-			testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-				DefaultOrgRole: string(org.RoleNone),
-				Password:       user.Password(password),
-				Login:          login,
-				OrgID:          1,
-			})
-
-			permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-			_, err = permissionsStore.SetUserResourcePermission(
-				ctx,
-				1,
-				accesscontrol.User{ID: testUserId},
-				resourcepermissions.SetResourcePermissionCommand{
+			createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+				{
 					Actions:           []string{datasources.ActionRead},
 					Resource:          "datasources",
 					ResourceAttribute: "uid",
 					ResourceID:        "*",
 				},
-				nil,
-			)
-			require.NoError(t, err)
-
-			cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-				login, password, grafanaListeningAddr)
-			cacheResp, err := http.Get(cacheURL)
-			require.NoError(t, err)
-			cacheResp.Body.Close()
+			})
 
 			url := fmt.Sprintf("http://%s:%s@%s/api/datasources/uid/%s",
 				login, password, grafanaListeningAddr, dsUID)
@@ -228,33 +210,14 @@ func runGetTests(t *testing.T, ctx context.Context, grafanaListeningAddr string,
 
 		login := fmt.Sprintf("%s-user-get-2", modePrefix)
 		password := "testpass"
-		testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-		_, err = permissionsStore.SetUserResourcePermission(
-			ctx,
-			1,
-			accesscontrol.User{ID: testUserId},
-			resourcepermissions.SetResourcePermissionCommand{
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+			{
 				Actions:           []string{datasources.ActionRead},
 				Resource:          "datasources",
 				ResourceAttribute: "uid",
 				ResourceID:        "other-uid",
 			},
-			nil,
-		)
-		require.NoError(t, err)
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		})
 
 		url := fmt.Sprintf("http://%s:%s@%s/api/datasources/uid/%s",
 			login, password, grafanaListeningAddr, dsUID)
@@ -280,18 +243,9 @@ func runGetTests(t *testing.T, ctx context.Context, grafanaListeningAddr string,
 
 		login := fmt.Sprintf("%s-user-get-3", modePrefix)
 		password := "testpass"
-		_ = tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
 
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		// create user with no resource permissions
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{})
 
 		url := fmt.Sprintf("http://%s:%s@%s/api/datasources/uid/%s",
 			login, password, grafanaListeningAddr, dsUID)
@@ -307,16 +261,7 @@ func runGetTests(t *testing.T, ctx context.Context, grafanaListeningAddr string,
 		dsUID := fmt.Sprintf("%s-ds-role-admin-get", modePrefix)
 		createTestDataSource(t, ctx, testEnv.Server.HTTPServer.DataSourcesService, dsUID, "Test DS for Admin GET")
 
-		login := fmt.Sprintf("%s-admin-user-get", modePrefix)
-		password := "testpass"
-		_ = tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleAdmin),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		url := fmt.Sprintf("http://%s:%s@%s/api/datasources/uid/%s", login, password, grafanaListeningAddr, dsUID)
+		url := fmt.Sprintf("http://admin:admin@%s/api/datasources/uid/%s", grafanaListeningAddr, dsUID)
 		resp, err := http.Get(url)
 		require.NoError(t, err)
 		defer resp.Body.Close()
@@ -368,7 +313,8 @@ func runGetTests(t *testing.T, ctx context.Context, grafanaListeningAddr string,
 }
 
 // TestIntegrationDataSourcePutByUID tests the PUT /api/datasources/uid/:uid endpoint.
-// Currently only runs with legacy mode as K8s PUT handler is not yet implemented.
+//
+// k8s-reroute PUT handler is not implemented yet! This only tests the legacy mode.
 func TestIntegrationDataSourcePutByUID(t *testing.T) {
 	testutil.SkipIntegrationTestInShortMode(t)
 
@@ -415,19 +361,21 @@ func TestIntegrationDataSourcePutByUID(t *testing.T) {
 		err = json.NewDecoder(resp.Body).Decode(&result)
 		require.NoError(t, err)
 
-		ds := result["datasource"].(map[string]any)
-		require.Equal(t, "Updated Name", ds["name"])
-		require.Equal(t, "http://localhost:9091", ds["url"])
+		fmt.Printf("result: %+v\n", result["datasource"])
 
-		getResp, err := http.Get(url)
-		require.NoError(t, err)
-		defer getResp.Body.Close()
-
+		// Check the updated datasource looks as expected.
+		// the PUT response embeds the updated datasource in the "datasource" property, so extract it.
 		var dto dtos.DataSource
-		err = json.NewDecoder(getResp.Body).Decode(&dto)
+		b, err := json.Marshal(result["datasource"])
+		require.NoError(t, err)
+		err = json.Unmarshal(b, &dto)
 		require.NoError(t, err)
 		require.Equal(t, "Updated Name", dto.Name)
 		require.Equal(t, "http://localhost:9091", dto.Url)
+		require.Equal(t, datasources.DsAccess(datasources.DS_ACCESS_PROXY), dto.Access)
+		require.Equal(t, "prometheus", dto.Type)
+		require.NotNil(t, dto.JsonData)
+		require.Equal(t, int64(1), dto.OrgId)
 	})
 
 	t.Run("PUT - not found", func(t *testing.T) {
@@ -465,33 +413,14 @@ func TestIntegrationDataSourcePutByUID(t *testing.T) {
 
 		login := "user-put-0"
 		password := "testpass"
-		testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-		_, err = permissionsStore.SetUserResourcePermission(
-			ctx,
-			1,
-			accesscontrol.User{ID: testUserId},
-			resourcepermissions.SetResourcePermissionCommand{
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+			{
 				Actions:           []string{datasources.ActionWrite},
 				Resource:          "datasources",
 				ResourceAttribute: "uid",
 				ResourceID:        dsUID,
 			},
-			nil,
-		)
-		require.NoError(t, err)
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		})
 
 		updatePayload := map[string]any{
 			"name":   "Updated Name 0",
@@ -528,33 +457,14 @@ func TestIntegrationDataSourcePutByUID(t *testing.T) {
 
 		login := "user-put-1"
 		password := "testpass"
-		testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-		_, err = permissionsStore.SetUserResourcePermission(
-			ctx,
-			1,
-			accesscontrol.User{ID: testUserId},
-			resourcepermissions.SetResourcePermissionCommand{
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+			{
 				Actions:           []string{datasources.ActionWrite},
 				Resource:          "datasources",
 				ResourceAttribute: "uid",
 				ResourceID:        "*",
 			},
-			nil,
-		)
-		require.NoError(t, err)
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		})
 
 		updatePayload := map[string]any{
 			"name":   "Updated Name 1",
@@ -591,33 +501,14 @@ func TestIntegrationDataSourcePutByUID(t *testing.T) {
 
 		login := "user-put-2"
 		password := "testpass"
-		testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-		_, err = permissionsStore.SetUserResourcePermission(
-			ctx,
-			1,
-			accesscontrol.User{ID: testUserId},
-			resourcepermissions.SetResourcePermissionCommand{
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+			{
 				Actions:           []string{datasources.ActionWrite},
 				Resource:          "datasources",
 				ResourceAttribute: "uid",
 				ResourceID:        "other-uid",
 			},
-			nil,
-		)
-		require.NoError(t, err)
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		})
 
 		updatePayload := map[string]any{
 			"name":   "Updated Name 2",
@@ -654,33 +545,14 @@ func TestIntegrationDataSourcePutByUID(t *testing.T) {
 
 		login := "user-put-3"
 		password := "testpass"
-		testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-		_, err = permissionsStore.SetUserResourcePermission(
-			ctx,
-			1,
-			accesscontrol.User{ID: testUserId},
-			resourcepermissions.SetResourcePermissionCommand{
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+			{
 				Actions:           []string{datasources.ActionRead},
 				Resource:          "datasources",
 				ResourceAttribute: "uid",
 				ResourceID:        dsUID,
 			},
-			nil,
-		)
-		require.NoError(t, err)
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		})
 
 		updatePayload := map[string]any{
 			"name":   "Updated Name 3",
@@ -717,18 +589,7 @@ func TestIntegrationDataSourcePutByUID(t *testing.T) {
 
 		login := "user-put-4"
 		password := "testpass"
-		_ = tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{})
 
 		updatePayload := map[string]any{
 			"name":   "Updated Name 4",
@@ -849,7 +710,8 @@ func TestIntegrationDataSourcePutByUID(t *testing.T) {
 }
 
 // TestIntegrationDataSourceDeleteByUID tests the DELETE /api/datasources/uid/:uid endpoint.
-// Currently only runs with legacy mode as K8s DELETE handler is not yet implemented.
+//
+// k8s-reroute DELETE handler is not implemented yet! This only tests the legacy mode.
 func TestIntegrationDataSourceDeleteByUID(t *testing.T) {
 	testutil.SkipIntegrationTestInShortMode(t)
 
@@ -916,33 +778,14 @@ func TestIntegrationDataSourceDeleteByUID(t *testing.T) {
 
 		login := "user-delete-0"
 		password := "testpass"
-		testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-		_, err = permissionsStore.SetUserResourcePermission(
-			ctx,
-			1,
-			accesscontrol.User{ID: testUserId},
-			resourcepermissions.SetResourcePermissionCommand{
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+			{
 				Actions:           []string{datasources.ActionDelete},
 				Resource:          "datasources",
 				ResourceAttribute: "uid",
 				ResourceID:        dsUID,
 			},
-			nil,
-		)
-		require.NoError(t, err)
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		})
 
 		url := fmt.Sprintf("http://%s:%s@%s/api/datasources/uid/%s",
 			login, password, grafanaListeningAddr, dsUID)
@@ -970,33 +813,14 @@ func TestIntegrationDataSourceDeleteByUID(t *testing.T) {
 
 		login := "user-delete-1"
 		password := "testpass"
-		testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-		_, err = permissionsStore.SetUserResourcePermission(
-			ctx,
-			1,
-			accesscontrol.User{ID: testUserId},
-			resourcepermissions.SetResourcePermissionCommand{
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+			{
 				Actions:           []string{datasources.ActionDelete},
 				Resource:          "datasources",
 				ResourceAttribute: "uid",
 				ResourceID:        "*",
 			},
-			nil,
-		)
-		require.NoError(t, err)
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		})
 
 		url := fmt.Sprintf("http://%s:%s@%s/api/datasources/uid/%s",
 			login, password, grafanaListeningAddr, dsUID)
@@ -1024,33 +848,14 @@ func TestIntegrationDataSourceDeleteByUID(t *testing.T) {
 
 		login := "user-delete-2"
 		password := "testpass"
-		testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-		_, err = permissionsStore.SetUserResourcePermission(
-			ctx,
-			1,
-			accesscontrol.User{ID: testUserId},
-			resourcepermissions.SetResourcePermissionCommand{
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+			{
 				Actions:           []string{datasources.ActionDelete},
 				Resource:          "datasources",
 				ResourceAttribute: "uid",
 				ResourceID:        "other-uid",
 			},
-			nil,
-		)
-		require.NoError(t, err)
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		})
 
 		url := fmt.Sprintf("http://%s:%s@%s/api/datasources/uid/%s",
 			login, password, grafanaListeningAddr, dsUID)
@@ -1078,33 +883,14 @@ func TestIntegrationDataSourceDeleteByUID(t *testing.T) {
 
 		login := "user-delete-3"
 		password := "testpass"
-		testUserId := tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		permissionsStore := resourcepermissions.NewStore(cfg, store, featuremgmt.WithFeatures())
-		_, err = permissionsStore.SetUserResourcePermission(
-			ctx,
-			1,
-			accesscontrol.User{ID: testUserId},
-			resourcepermissions.SetResourcePermissionCommand{
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{
+			{
 				Actions:           []string{datasources.ActionRead},
 				Resource:          "datasources",
 				ResourceAttribute: "uid",
 				ResourceID:        dsUID,
 			},
-			nil,
-		)
-		require.NoError(t, err)
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		})
 
 		url := fmt.Sprintf("http://%s:%s@%s/api/datasources/uid/%s",
 			login, password, grafanaListeningAddr, dsUID)
@@ -1132,18 +918,7 @@ func TestIntegrationDataSourceDeleteByUID(t *testing.T) {
 
 		login := "user-delete-4"
 		password := "testpass"
-		_ = tests.CreateUser(t, store, cfg, user.CreateUserCommand{
-			DefaultOrgRole: string(org.RoleNone),
-			Password:       user.Password(password),
-			Login:          login,
-			OrgID:          1,
-		})
-
-		cacheURL := fmt.Sprintf("http://%s:%s@%s/api/access-control/user/permissions?reloadcache=true",
-			login, password, grafanaListeningAddr)
-		cacheResp, err := http.Get(cacheURL)
-		require.NoError(t, err)
-		cacheResp.Body.Close()
+		createUserWithPermissions(t, ctx, store, cfg, grafanaListeningAddr, login, []resourcepermissions.SetResourcePermissionCommand{})
 
 		url := fmt.Sprintf("http://%s:%s@%s/api/datasources/uid/%s",
 			login, password, grafanaListeningAddr, dsUID)
@@ -1227,8 +1002,7 @@ func TestIntegrationDataSourceDeleteByUID(t *testing.T) {
 	})
 }
 
-
-// Helper function to create a test datasource
+// createTestDataSource creates a datasource in the provided datasource service.
 func createTestDataSource(t *testing.T, ctx context.Context, dsService datasources.DataSourceService, uid, name string) {
 	t.Helper()
 	_, err := dsService.AddDataSource(ctx, &datasources.AddDataSourceCommand{
@@ -1242,7 +1016,7 @@ func createTestDataSource(t *testing.T, ctx context.Context, dsService datasourc
 	require.NoError(t, err)
 }
 
-// Helper function to create a user with specific permissions and reload the cache
+// createUserWithPermissions creates a user with the provided permissions
 func createUserWithPermissions(
 	t *testing.T,
 	ctx context.Context,
@@ -1281,4 +1055,5 @@ func createUserWithPermissions(
 	cacheResp, err := http.Get(cacheURL)
 	require.NoError(t, err)
 	cacheResp.Body.Close()
+
 }
