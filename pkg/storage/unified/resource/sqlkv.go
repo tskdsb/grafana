@@ -124,6 +124,10 @@ func (k *sqlKV) Keys(ctx context.Context, section string, opt ListOptions) iter.
 }
 
 func (k *sqlKV) Get(ctx context.Context, section string, key string) (io.ReadCloser, error) {
+	if key == "" {
+		return nil, fmt.Errorf("key is required")
+	}
+
 	qb, err := k.getQueryBuilder(section)
 	if err != nil {
 		return nil, err
@@ -303,6 +307,10 @@ func (w *sqlWriteCloser) Close() error {
 }
 
 func (k *sqlKV) Delete(ctx context.Context, section string, key string) error {
+	if key == "" {
+		return fmt.Errorf("key is required")
+	}
+
 	qb, err := k.getQueryBuilder(section)
 	if err != nil {
 		return err
