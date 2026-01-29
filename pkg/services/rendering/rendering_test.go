@@ -128,9 +128,9 @@ func TestRenderLimitImage(t *testing.T) {
 		Cfg: &setting.Cfg{
 			HomePath: path,
 		},
-		inProgressCount: 2,
-		log:             log.New("test"),
+		log: log.New("test"),
 	}
+	rs.inProgressCount.Store(2)
 
 	tests := []struct {
 		name     string
@@ -166,10 +166,11 @@ func TestRenderLimitImage(t *testing.T) {
 
 func TestRenderLimitImageError(t *testing.T) {
 	rs := RenderingService{
-		Cfg:             &setting.Cfg{},
-		inProgressCount: 2,
-		log:             log.New("test"),
+		Cfg: &setting.Cfg{},
+		log: log.New("test"),
 	}
+	rs.inProgressCount.Store(2)
+
 	opts := Opts{
 		ErrorOpts:       ErrorOpts{ErrorConcurrentLimitReached: true},
 		ConcurrentLimit: 1,

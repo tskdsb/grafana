@@ -34,7 +34,7 @@ type RenderingService struct {
 	sanitizeSVGAction sanitizeFunc
 	sanitizeURL       string
 	domain            string
-	inProgressCount   int32
+	inProgressCount   atomic.Int32
 	version           string
 	versionMutex      sync.RWMutex
 	capabilities      []Capability
@@ -256,7 +256,9 @@ func (rs *RenderingService) Render(ctx context.Context, opts Opts, session Sessi
 }
 
 func (rs *RenderingService) render(ctx context.Context, opts Opts, renderKeyProvider renderKeyProvider) (*RenderResult, error) {
-	if int(atomic.LoadInt32(&rs.inProgressCount)) > opts.ConcurrentLimit {
+	inProgressCount := rs.inProgressCount.Load()
+	newInProgressCount := inProgressCount + 1
+	if int(newInProgressCount) > opts.ConcurrentLimit || !rs.inProgressCount.CompareAndSwap(inProgressCount, newInProgressCount) {
 		rs.log.Warn("Could not render image, hit the currency limit", "concurrencyLimit", opts.ConcurrentLimit, "path", opts.Path)
 		if opts.ErrorConcurrentLimitReached {
 			return nil, ErrConcurrentLimitReached
@@ -294,10 +296,10 @@ func (rs *RenderingService) render(ctx context.Context, opts Opts, renderKeyProv
 	defer renderKeyProvider.afterRequest(ctx, opts.AuthOpts, renderKey)
 
 	defer func() {
-		metrics.MRenderingQueue.Set(float64(atomic.AddInt32(&rs.inProgressCount, -1)))
+		metrics.MRenderingQueue.Set(float64(rs.inProgressCount.Add(-1)))
 	}()
 
-	metrics.MRenderingQueue.Set(float64(atomic.AddInt32(&rs.inProgressCount, 1)))
+	metrics.MRenderingQueue.Set(float64(newInProgressCount))
 	return rs.renderAction(ctx, renderKey, opts)
 }
 
@@ -335,7 +337,9 @@ func (rs *RenderingService) SanitizeSVG(ctx context.Context, req *SanitizeSVGReq
 }
 
 func (rs *RenderingService) renderCSV(ctx context.Context, opts CSVOpts, renderKeyProvider renderKeyProvider) (*RenderCSVResult, error) {
-	if int(atomic.LoadInt32(&rs.inProgressCount)) > opts.ConcurrentLimit {
+	inProgressCount := rs.inProgressCount.Load()
+	newInProgressCount := inProgressCount + 1
+	if int(newInProgressCount) > opts.ConcurrentLimit || !rs.inProgressCount.CompareAndSwap(inProgressCount, newInProgressCount) {
 		return nil, ErrConcurrentLimitReached
 	}
 
@@ -352,10 +356,10 @@ func (rs *RenderingService) renderCSV(ctx context.Context, opts CSVOpts, renderK
 	defer renderKeyProvider.afterRequest(ctx, opts.AuthOpts, renderKey)
 
 	defer func() {
-		metrics.MRenderingQueue.Set(float64(atomic.AddInt32(&rs.inProgressCount, -1)))
+		metrics.MRenderingQueue.Set(float64(rs.inProgressCount.Add(-1)))
 	}()
 
-	metrics.MRenderingQueue.Set(float64(atomic.AddInt32(&rs.inProgressCount, 1)))
+	metrics.MRenderingQueue.Set(float64(newInProgressCount))
 	return rs.renderCSVAction(ctx, renderKey, opts)
 }
 
