@@ -114,7 +114,11 @@ describe('notify', () => {
           title: 'test2',
           text: 'test alert fail 2',
           timestamp,
-          showing: true,
+
+          // we don't care about still showing toasts after refreshing
+          // https://github.com/grafana/grafana/issues/71932
+          // copy from https://github.com/grafana/grafana/pull/74712
+          showing: false,
         },
         [id3]: {
           id: id3,
