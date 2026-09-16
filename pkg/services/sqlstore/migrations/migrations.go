@@ -100,6 +100,8 @@ func (*OSSMigrations) AddMigration(mg *Migrator) {
 	AddExternalAlertmanagerToDatasourceMigration(mg)
 
 	addFolderMigrations(mg)
+
+	addDsRateLimitMigration(mg)
 }
 
 func addMigrationLogMigrations(mg *Migrator) {

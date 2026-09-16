@@ -444,6 +444,9 @@ type Cfg struct {
 
 	Quota QuotaSettings
 
+	// Datasource query rate limit
+	DsRateLimit DsRateLimitSettings
+
 	AutoAssignOrg              bool
 	AutoAssignOrgId            int
 	AutoAssignOrgRole          string
@@ -1118,6 +1121,8 @@ func (cfg *Cfg) Load(args CommandLineArgs) error {
 	}
 
 	cfg.readQuotaSettings()
+
+	cfg.readDsRateLimitSettings()
 
 	cfg.readExpressionsSettings()
 	if err := cfg.readGrafanaEnvironmentMetrics(); err != nil {
