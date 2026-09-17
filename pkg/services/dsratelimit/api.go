@@ -255,6 +255,26 @@ func (s *Service) AdminStats(c *contextmodel.ReqContext) response.Response {
 		// enforcing" -- and with both now readable from two sources, an
 		// operator needs one field that is simply the truth.
 		"enforcing": s.enforcing(snap),
+		// The in-flight cap, reported separately because it is a separate
+		// rollout: it can be observing while the QPS layer enforces, and
+		// "enforcing" above answers only for QPS.
+		//
+		// concurrency_enforcing is the field that matters operationally. The
+		// cap can be silently doing nothing for three different reasons --
+		// the service is off, the cap is off, or no limit has been set -- and
+		// an operator who has just switched something on needs one field that
+		// says whether requests are being rejected, not three they have to
+		// combine correctly.
+		"concurrency": map[string]any{
+			"enabled":     s.cfg.ConcurrencyEnabled,
+			"shadow_mode": s.cfg.ConcurrencyShadowMode,
+			"limit":       s.cfg.DefaultUserConcurrency,
+			"enforcing": s.cfg.Enabled && s.cfg.ConcurrencyEnabled &&
+				!s.cfg.ConcurrencyShadowMode && s.cfg.DefaultUserConcurrency > 0,
+			// Counting is what the observation week depends on, and it needs
+			// less than enforcing does: a limit of zero still records.
+			"recording": s.cfg.Enabled && s.cfg.ConcurrencyEnabled,
+		},
 		"sources": map[string]any{
 			"shadow_mode": shadowSource,
 		},

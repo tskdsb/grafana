@@ -16,6 +16,17 @@ type DsRateLimitSettings struct {
 	DefaultUserBurst int
 	CacheMaxEntries  int
 
+	// ConcurrencyEnabled gates the in-flight cap independently of Enabled: the
+	// QPS layer is already live, and this one has to be observed in production
+	// before anyone can pick a limit.
+	ConcurrencyEnabled bool
+	// DefaultUserConcurrency is the per-identity in-flight cap. 0 = unlimited.
+	DefaultUserConcurrency int
+	// ConcurrencyShadowMode observes instead of rejecting, for the in-flight
+	// cap only. Separate from ShadowMode so the two layers can be rolled out
+	// independently once QPS is enforcing.
+	ConcurrencyShadowMode bool
+
 	// Quotas holds the deploy-time per-datasource quotas declared as
 	// [datasource_ratelimit.quota.<uid>] sections, keyed by datasource UID.
 	//
@@ -50,6 +61,13 @@ func (cfg *Cfg) readDsRateLimitSettings() {
 	cfg.DsRateLimit.DefaultUserRate = s.Key("default_user_rate").MustInt(20)
 	cfg.DsRateLimit.DefaultUserBurst = s.Key("default_user_burst").MustInt(40)
 	cfg.DsRateLimit.CacheMaxEntries = s.Key("cache_max_entries").MustInt(10000)
+	cfg.DsRateLimit.ConcurrencyEnabled = s.Key("concurrency_enabled").MustBool(false)
+	// 0 = unlimited, which is the deploy default: the number can only come
+	// from the concurrency_inflight histogram after this has run for a while.
+	cfg.DsRateLimit.DefaultUserConcurrency = s.Key("default_user_concurrency").MustInt(0)
+	// Shadow by default, like the QPS layer: a new enforcement path must not
+	// start rejecting on its own.
+	cfg.DsRateLimit.ConcurrencyShadowMode = s.Key("concurrency_shadow_mode").MustBool(true)
 	cfg.DsRateLimit.Quotas = extractDsRateLimitQuotas(cfg.Raw.Sections())
 }
 
@@ -65,8 +83,16 @@ func (cfg *Cfg) readDsRateLimitSettings() {
 func extractDsRateLimitQuotas(sections []*ini.Section) map[string]DsRateLimitQuota {
 	out := map[string]DsRateLimitQuota{}
 	for _, section := range sections {
-		uid, ok := strings.CutPrefix(section.Name(), dsRateLimitQuotaPrefix)
-		if !ok || uid == "" {
+		// HasPrefix + slicing rather than strings.CutPrefix: go.mod declares
+		// go 1.19 and CutPrefix arrived in 1.20. Local builds and the image
+		// build both run a newer toolchain, so this compiled everywhere it was
+		// tried and only failed once CI pinned the declared version.
+		name := section.Name()
+		if !strings.HasPrefix(name, dsRateLimitQuotaPrefix) {
+			continue
+		}
+		uid := name[len(dsRateLimitQuotaPrefix):]
+		if uid == "" {
 			continue
 		}
 		out[uid] = DsRateLimitQuota{
