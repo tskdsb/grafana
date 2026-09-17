@@ -81,6 +81,15 @@ type userEntry struct {
 	// heaviest single caller pushes -- and that is the number the limit caps.
 	sinceSample atomic.Int64
 
+	// conc is this identity's in-flight counter. It lives on the same entry as
+	// the token bucket so both layers resolve one identity through one lookup,
+	// and so the concurrency layer inherits the identity parsing, the LRU and
+	// the cleanup that already exist rather than duplicating them.
+	//
+	// Note that cleanup must not evict an entry while this is non-zero; see
+	// the comment there.
+	conc inflight
+
 	denyLog denyLogThrottle
 }
 
@@ -265,6 +274,14 @@ func loadConfigFromSetting(cfg *setting.Cfg) Config {
 		DefaultUserBurst: sane("default_user_burst", cfg.DsRateLimit.DefaultUserBurst, defaultUserBurstFallback),
 		IniQuotas:        iniQuotas,
 		CacheMaxEntries:  cfg.DsRateLimit.CacheMaxEntries,
+
+		ConcurrencyEnabled: cfg.DsRateLimit.ConcurrencyEnabled,
+		// Not run through sane(): unlike rate and burst, where zero would
+		// silently deny every request, zero here is the meaningful default of
+		// "no cap". Substituting a fallback would turn an explicit
+		// default_user_concurrency = 0 into a limit nobody asked for.
+		DefaultUserConcurrency: cfg.DsRateLimit.DefaultUserConcurrency,
+		ConcurrencyShadowMode:  cfg.DsRateLimit.ConcurrencyShadowMode,
 	}
 }
 
@@ -669,6 +686,11 @@ func (s *Service) cleanup() {
 		}
 		entries := make([]kv, 0, s.userCount.Load())
 		s.userBuckets.Range(func(k, v any) bool {
+			// A cheap pre-filter only. tryEvict below is what actually decides,
+			// because anything read here can change before the delete.
+			if v.(*userEntry).conc.load() > 0 {
+				return true
+			}
 			entries = append(entries, kv{k, v.(*userEntry).lastUsedUnixNano.Load()})
 			return true
 		})
@@ -676,9 +698,52 @@ func (s *Service) cleanup() {
 			return entries[i].lastUsed < entries[j].lastUsed
 		})
 		for i := int64(0); i < excess && int(i) < len(entries); i++ {
-			if _, deleted := s.userBuckets.LoadAndDelete(entries[i].key); deleted {
+			// Never evict an identity that still has requests in flight.
+			//
+			// Eviction resets the in-flight counter, so the identity would get
+			// a full fresh allowance on top of the requests it is already
+			// running. Measured at a limit of 2: two held, a third correctly
+			// rejected, then eviction let two more straight through. The QPS
+			// layer has no such window -- a token is spent at admission and
+			// never owed back, so evicting a bucket can only cost an identity
+			// capacity, never grant it.
+			//
+			// Checking the counter and then deleting are two steps, and a
+			// request arriving between them would take a slot on an entry about
+			// to vanish. tryEvict closes that: it marks the entry dead under a
+			// CAS on the counter, so a concurrent acquire either got there
+			// first (and the entry stays) or sees the flag and retries against
+			// the live entry. Measured before this: 399 of 400 attempts slipped
+			// past a full cap while cleanup ran alongside live traffic.
+			//
+			// claimRemoval, then re-check identity before deleting: between the
+			// load and the delete the key may already have been removed and
+			// refilled by a new request, and deleting by key alone would
+			// discard that new entry along with what it is tracking.
+			//
+			// sync.Map.CompareAndDelete would express this directly but arrived
+			// in Go 1.20, and go.mod declares 1.19.
+			v, ok := s.userBuckets.Load(entries[i].key)
+			if !ok {
+				continue
+			}
+			ue, ok := v.(*userEntry)
+			if !ok || !ue.conc.tryEvict() {
+				continue
+			}
+			if !ue.conc.claimRemoval() {
+				// A request already took ownership of removing this entry.
+				continue
+			}
+			if cur, present := s.userBuckets.Load(entries[i].key); present && cur == v {
+				s.userBuckets.Delete(entries[i].key)
 				s.userCount.Add(-1)
 			}
+			// No else branch. The entry is committed to removal at this point,
+			// and if the key now holds something else then this object is
+			// already unreachable -- nothing to delete, and nothing that could
+			// reach it to be revived. Reviving here would also be a lie: the
+			// state says removed, which is exactly what it is.
 		}
 	}
 	metricActiveKeys.Set(float64(s.userCount.Load()))

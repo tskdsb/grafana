@@ -624,6 +624,18 @@ func (hs *HTTPServer) addMiddlewaresAndStaticRoutes() {
 	m.Use(hs.frontendLogEndpoints())
 
 	m.UseMiddleware(hs.ContextHandler.Middleware)
+
+	// Must sit after ContextHandler: the cap is per identity, and
+	// ContextHandler is what puts the identity on the request.
+	//
+	// Global rather than per route, unlike the QPS limiter next to the
+	// datasource routes in api.go. Releasing a slot requires knowing when the
+	// request ended, and pkg/web's Context has no Next() -- a route-level
+	// handler returns long before the response does. A wrapping middleware
+	// gets that for free. The cost is that it sees every request and has to
+	// recognise datasource queries by path; see isManagedPath.
+	m.UseMiddleware(hs.DsRateLimit.ConcurrencyMiddleware)
+
 	m.Use(middleware.OrgRedirect(hs.Cfg, hs.userService))
 	if !hs.Features.IsEnabled(featuremgmt.FlagAuthnService) {
 		m.Use(accesscontrol.LoadPermissionsMiddleware(hs.accesscontrolService))

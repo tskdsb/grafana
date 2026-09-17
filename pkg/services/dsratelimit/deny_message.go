@@ -125,6 +125,27 @@ func (in denyMessageInput) String() string {
 		who = "Your personal"
 	}
 
+	// Waiting does not clear a concurrency rejection the way it clears a rate
+	// one: the slots are held by the caller's own queries, so time passes and
+	// nothing frees up until one of those returns. "Try again in N seconds"
+	// would send them into a retry loop on a timer that has no bearing on when
+	// capacity appears, so the advice has to name the action that does work.
+	//
+	// "Wait for your running queries to finish" rather than anything about
+	// panels or tabs. Those exist only for a browser, and the identities most
+	// likely to saturate this limit are service accounts and scripts, which
+	// have neither -- telling an automated caller to close a tab is advice it
+	// cannot act on. Every caller does have running queries, so that is the
+	// one remedy true for all of them.
+	if in.Kind == denyKindConcurrent {
+		limitPart := ""
+		if in.Limit > 0 {
+			limitPart = fmt.Sprintf(" (%d %s)", in.Limit, in.unit())
+		}
+		return fmt.Sprintf("%s %s limit reached%s. ", who, in.kindNoun(), limitPart) +
+			"Wait for your running queries to finish."
+	}
+
 	// A request over burst can never be admitted, so it gets advice that can
 	// actually succeed -- fewer queries per request -- instead of a wait.
 	if in.Permanent {

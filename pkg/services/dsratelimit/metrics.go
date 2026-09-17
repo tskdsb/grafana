@@ -149,6 +149,62 @@ var (
 		// than collapsing into +Inf.
 		Buckets: []float64{1, 2, 5, 10, 20, 30, 50, 100, 200, 500, 1000},
 	}, []string{"kind"})
+
+	// metricConcurrencyDenied counts requests the in-flight cap turned away.
+	//
+	// Separate from denied_total rather than another label on it: that counter
+	// is denominated in tokens and a concurrency rejection spends none, so
+	// folding them together would corrupt the token arithmetic that
+	// default_user_rate is sized against.
+	metricConcurrencyDenied = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "grafana",
+		Subsystem: "datasource_ratelimit",
+		Name:      "concurrency_denied_total",
+		Help: "Requests refused by the per-identity in-flight cap. Unit: requests. " +
+			"enforced=\"false\" means shadow mode: counted as denied but served anyway.",
+	}, []string{"kind", "enforced"})
+
+	// metricConcurrencyInflight records how many requests one identity had in
+	// flight, observed on admission.
+	//
+	// A histogram rather than a gauge. A gauge labelled only by kind would be
+	// overwritten by whichever identity was admitted last, so the peak that
+	// matters -- one caller holding many slow queries -- would be erased by the
+	// next ordinary request. The histogram keeps the distribution, which is the
+	// input for choosing default_user_concurrency.
+	metricConcurrencyInflight = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "grafana",
+		Subsystem: "datasource_ratelimit",
+		Name:      "concurrency_inflight",
+		Help: "Per-identity in-flight datasource queries, observed when a request is admitted. " +
+			"Read the high quantiles to size default_user_concurrency.",
+		// Starts at 1 because admission always observes at least the request
+		// being admitted, and reaches 500 so a runaway caller shows as its own
+		// bucket instead of vanishing into +Inf.
+		Buckets: []float64{1, 2, 3, 5, 8, 12, 20, 30, 50, 100, 200, 500},
+	}, []string{"kind"})
+
+	// metricConcurrencyHeld is the live count of in-flight requests the cap is
+	// tracking, across all identities. Unlike the histogram this answers "is
+	// anything happening right now", which is what an operator checks first
+	// when deciding whether the cap is doing something.
+	// metricConcurrencyFailOpen counts requests the cap let through without
+	// counting them, because it could not obtain a live entry. Should stay at
+	// zero; a non-zero value means the eviction protocol is not self-healing
+	// and the cap is quietly leaking capacity.
+	metricConcurrencyFailOpen = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "grafana",
+		Subsystem: "datasource_ratelimit",
+		Name:      "concurrency_fail_open_total",
+		Help:      "Requests admitted uncounted because no live in-flight entry could be obtained. Expected to stay at zero.",
+	})
+
+	metricConcurrencyHeld = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "grafana",
+		Subsystem: "datasource_ratelimit",
+		Name:      "concurrency_held",
+		Help:      "Datasource query slots currently held across all identities.",
+	})
 )
 
 func init() {
@@ -165,5 +221,9 @@ func init() {
 		metricLastReload,
 		metricOversizedBody,
 		metricUserRate,
+		metricConcurrencyDenied,
+		metricConcurrencyInflight,
+		metricConcurrencyHeld,
+		metricConcurrencyFailOpen,
 	)
 }

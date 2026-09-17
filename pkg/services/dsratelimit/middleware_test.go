@@ -515,7 +515,8 @@ func routeParamsFor(path string) map[string]string {
 		"/api/datasources/proxy/uid/",
 		"/api/datasources/uid/",
 	} {
-		if rest, ok := strings.CutPrefix(path, prefix); ok {
+		if strings.HasPrefix(path, prefix) {
+			rest := path[len(prefix):]
 			uid, _, _ := strings.Cut(rest, "/")
 			if uid != "" && uid != "resources" {
 				return map[string]string{":uid": uid}
@@ -526,7 +527,8 @@ func routeParamsFor(path string) map[string]string {
 		"/api/datasources/proxy/",
 		"/api/datasources/",
 	} {
-		if rest, ok := strings.CutPrefix(path, prefix); ok {
+		if strings.HasPrefix(path, prefix) {
+			rest := path[len(prefix):]
 			id, _, _ := strings.Cut(rest, "/")
 			if id == "" {
 				continue
