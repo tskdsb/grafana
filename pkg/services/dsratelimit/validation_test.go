@@ -2,10 +2,12 @@ package dsratelimit
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/grafana/grafana/pkg/api/response"
+	"github.com/grafana/grafana/pkg/infra/log"
 	"github.com/grafana/grafana/pkg/services/user"
 
 	"github.com/stretchr/testify/require"
@@ -33,23 +35,23 @@ func TestSanitizeParams(t *testing.T) {
 	}{
 		{"typical", 30, 100, true, 30, 100},
 		{"rate equals burst", 50, 50, true, 50, 50},
-		{"at the ceiling", MaxRuleRate, MaxRuleBurst, true, int(MaxRuleRate), int(MaxRuleBurst)},
+		{"at the ceiling", DefaultMaxRuleRate, DefaultMaxRuleBurst, true, int(DefaultMaxRuleRate), int(DefaultMaxRuleBurst)},
 		{"zero rate", 0, 100, false, 0, 0},
 		{"zero burst", 30, 0, false, 0, 0},
 		{"both zero", 0, 0, false, 0, 0},
 		{"negative rate", -5, 100, false, 0, 0},
 		{"negative burst", 30, -1, false, 0, 0},
 		{"both negative", -5, -1, false, 0, 0},
-		{"rate above ceiling", MaxRuleRate + 1, 100, false, 0, 0},
-		{"burst above ceiling", 30, MaxRuleBurst + 1, false, 0, 0},
+		{"rate above ceiling", DefaultMaxRuleRate + 1, 100, false, 0, 0},
+		{"burst above ceiling", 30, DefaultMaxRuleBurst + 1, false, 0, 0},
 		{"int64 max", 1 << 62, 1 << 62, false, 0, 0},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := sanitizeParams(tc.rate, tc.burst)
+			got, ok := sanitizeParams(tc.rate, tc.burst, DefaultMaxRuleRate, DefaultMaxRuleBurst)
 			require.Equal(t, tc.wantOK, ok,
-				"sanitizeParams(%d, %d) ok mismatch", tc.rate, tc.burst)
+				"sanitizeParams(%d, %d, DefaultMaxRuleRate, DefaultMaxRuleBurst) ok mismatch", tc.rate, tc.burst)
 			if !tc.wantOK {
 				return
 			}
@@ -82,7 +84,7 @@ func TestSanitizeParams_RejectedValuesWouldDenyForever(t *testing.T) {
 			// And it never recovers, so the key is bricked until restart.
 			require.False(t, lim.Allow(), "still denied on retry")
 
-			_, ok := sanitizeParams(int64(tc.rate), int64(tc.burst))
+			_, ok := sanitizeParams(int64(tc.rate), int64(tc.burst), DefaultMaxRuleRate, DefaultMaxRuleBurst)
 			require.False(t, ok, "sanitizeParams must reject this pair")
 		})
 	}
@@ -103,7 +105,7 @@ func TestGetUserLimiter_InvalidRuleFallsBackToDefaults(t *testing.T) {
 		{"negative burst", 30, -1},
 		{"zero rate", 0, 100},
 		{"negative both", -1, -1},
-		{"above ceiling", MaxRuleRate + 1, MaxRuleBurst + 1},
+		{"above ceiling", DefaultMaxRuleRate + 1, DefaultMaxRuleBurst + 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, b := tc.rate, tc.burst
@@ -174,6 +176,13 @@ func TestValidKinds_MatchesWhitelist(t *testing.T) {
 // readDsRateLimitSettings unchanged, and x/time/rate does not reject them
 // either -- it accepts them and then denies every request forever without
 // recovering (v0.2.0 has no panic path).
+//
+// What the guard does with such a value changed: it returns 0, meaning this
+// layer does not limit, rather than falling back to 20/40. Both failure modes
+// that motivated the change were silent -- a zero reached x/time/rate and
+// refused everything, and a typo got a working limiter at a number nobody
+// picked. An unusable value expresses no intention, so the only honest
+// reading is to stay out of the way until a real one arrives.
 func TestConfigFallbacks_GuardBadIniValues(t *testing.T) {
 	for _, tc := range []struct {
 		name                        string
@@ -181,15 +190,14 @@ func TestConfigFallbacks_GuardBadIniValues(t *testing.T) {
 		wantUserRate, wantUserBurst int
 	}{
 		{"sane values pass through untouched", 20, 40, 20, 40},
-		{"zero is replaced", 0, 0,
-			defaultUserRateFallback, defaultUserBurstFallback},
-		{"negative is replaced", -1, -5,
-			defaultUserRateFallback, defaultUserBurstFallback},
-		{"above the ceiling is replaced",
-			int(MaxRuleRate) + 1, int(MaxRuleBurst) + 1,
-			defaultUserRateFallback, defaultUserBurstFallback},
-		{"one bad value does not disturb the other", -5, 40,
-			defaultUserRateFallback, 40},
+		// Every unusable value now disarms the layer instead of borrowing
+		// 20/40. Substituting a built-in number enforced a limit the
+		// deployment never chose, and told the operator only through a log
+		// line they had no reason to read.
+		{"zero means no limit", 0, 0, 0, 0},
+		{"negative disarms rather than substitutes", -1, -5, 0, 0},
+		{"above the ceiling disarms", int(DefaultMaxRuleRate) + 1, int(DefaultMaxRuleBurst) + 1, 0, 0},
+		{"one bad value does not disturb the other", -5, 40, 0, 40},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := setting.NewCfg()
@@ -201,12 +209,20 @@ func TestConfigFallbacks_GuardBadIniValues(t *testing.T) {
 			require.Equal(t, tc.wantUserRate, got.DefaultUserRate, "default_user_rate")
 			require.Equal(t, tc.wantUserBurst, got.DefaultUserBurst, "default_user_burst")
 
-			// The point of the fallback: whatever the ini said, the resulting
-			// limiter must admit traffic rather than refuse everything.
-			userLim := rate.NewLimiter(rate.Limit(got.DefaultUserRate), got.DefaultUserBurst)
-			require.True(t, userLim.Allow(),
-				"per-user limiter built from sanitised config must admit the first request; "+
-					"rate=%d burst=%d", got.DefaultUserRate, got.DefaultUserBurst)
+			// Whatever the ini said, traffic must be admitted rather than
+			// refused. Asserted through the middleware, not by building a
+			// limiter from the sanitised numbers: rate.NewLimiter(0, 0)
+			// refuses everything, which is exactly why zero now means
+			// "unlimited" one level up instead of reaching x/time/rate at
+			// all. Constructing the limiter here would test a path
+			// production never takes and fail on correct behaviour.
+			s := newTestService(got)
+			u := &user.SignedInUser{UserID: 1, OrgID: 1}
+			c, rec := buildCtx("POST", "/api/ds/query", []byte(`{"queries":[{}]}`), u)
+			s.Middleware(c)
+			require.Equal(t, http.StatusOK, rec.Code,
+				"a request must be admitted after config sanitisation; rate=%d burst=%d",
+				got.DefaultUserRate, got.DefaultUserBurst)
 		})
 	}
 
@@ -215,22 +231,79 @@ func TestConfigFallbacks_GuardBadIniValues(t *testing.T) {
 	// point -- covered by TestIntegrationReloadRules_IgnoresInvalidDatasourceQuota.
 }
 
-// TestConfigFallbacks_MatchSettingDefaults keeps the fallbacks in this package
-// equal to the MustInt fallbacks in pkg/setting. They are separate constants by
-// necessity -- this package must not import pkg/setting's private defaults --
-// but if they drift, the value used when the ini is malformed stops matching the
-// value used when the key is simply absent, for no visible reason.
-func TestConfigFallbacks_MatchSettingDefaults(t *testing.T) {
+func TestConfigFallbacks_UseIndependentRateAndBurstCeilings(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		maxRate, maxBurst           int
+		userRate, userBurst         int
+		wantUserRate, wantUserBurst int
+	}{
+		{
+			name:          "burst below its own higher ceiling is kept",
+			maxRate:       100,
+			maxBurst:      1000,
+			userRate:      50,
+			userBurst:     500,
+			wantUserRate:  50,
+			wantUserBurst: 500,
+		},
+		{
+			name:          "burst above its own lower ceiling is rejected",
+			maxRate:       1000,
+			maxBurst:      100,
+			userRate:      50,
+			userBurst:     500,
+			wantUserRate:  50,
+			wantUserBurst: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := setting.NewCfg()
+			cfg.DsRateLimit.MaxRuleRate = tc.maxRate
+			cfg.DsRateLimit.MaxRuleBurst = tc.maxBurst
+			cfg.DsRateLimit.DefaultUserRate = tc.userRate
+			cfg.DsRateLimit.DefaultUserBurst = tc.userBurst
+
+			got := loadConfigFromSetting(cfg)
+			require.Equal(t, tc.wantUserRate, got.DefaultUserRate)
+			require.Equal(t, tc.wantUserBurst, got.DefaultUserBurst)
+		})
+	}
+}
+
+// TestAbsentConfig_DoesNotLimit pins the startup contract across both layers:
+// a deployment that never states a limit does not get one.
+//
+// This replaces a test that asserted the opposite -- that this package's
+// fallback constants stayed equal to pkg/setting's MustInt fallbacks, so a
+// malformed value and an absent one both landed on 20/40. Keeping two
+// invented numbers in sync was the wrong goal; neither should have been
+// invented. Both layers now answer an absent value the same way, with no
+// number at all.
+//
+// Note this reads conf/defaults.ini from the repo, so it also catches the
+// case where the shipped file is edited to omit these keys.
+func TestAbsentConfig_DoesNotLimit(t *testing.T) {
 	cfg := setting.NewCfg()
 	cfg.Raw = ini.Empty()
-	// With no [datasource_ratelimit] section at all, every MustInt fallback
-	// applies -- that is the set this package must mirror.
+	// An empty ini means every MustInt fallback applies -- the state this
+	// contract is about.
 	require.NoError(t, cfg.Load(setting.CommandLineArgs{HomePath: "../../../"}))
 
-	require.Equal(t, cfg.DsRateLimit.DefaultUserRate, defaultUserRateFallback,
-		"defaultUserRateFallback drifted from conf/defaults.ini")
-	require.Equal(t, cfg.DsRateLimit.DefaultUserBurst, defaultUserBurstFallback,
-		"defaultUserBurstFallback drifted from conf/defaults.ini")
+	// conf/defaults.ini ships real numbers, so a normal install is limited.
+	// The contract is about what happens without them, which is what the
+	// section below constructs.
+	require.Positive(t, cfg.DsRateLimit.DefaultUserRate,
+		"conf/defaults.ini should still ship a usable default_user_rate")
+
+	bare := setting.NewCfg()
+	got := loadConfigFromSetting(bare)
+	require.Zero(t, got.DefaultUserRate,
+		"an unstated QPS rate must not become a limit")
+	require.Zero(t, got.DefaultUserBurst,
+		"an unstated QPS burst must not become a limit")
+	require.Zero(t, got.DefaultUserConcurrency,
+		"an unstated in-flight cap must not become a limit")
 }
 
 // TestIniQuotas_RejectInvalidSections locks validation of the deploy-time quota
@@ -262,7 +335,7 @@ func TestIniQuotas_RejectInvalidSections(t *testing.T) {
 		{name: "negative burst is dropped", rate: 350, burst: -1},
 		{name: "burst below rate is dropped", rate: 420, burst: 350},
 		{name: "rate above the ceiling is dropped",
-			rate: int(MaxRuleRate) + 1, burst: int(MaxRuleBurst) + 1},
+			rate: int(DefaultMaxRuleRate) + 1, burst: int(DefaultMaxRuleBurst) + 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := setting.NewCfg()
@@ -342,9 +415,8 @@ func TestAdminPut_RejectsUnmatchableTarget(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newAdminTestService(t)
-			r, b := int64(10), int64(20)
 			c := adminPutCtx(tc.kind, tc.target, UpsertBody{
-				Mode: string(ModeLimited), Rate: &r, Burst: &b,
+				Mode: string(ModeLimited), Rate: rawInt(10), Burst: rawInt(20),
 			})
 			got := s.AdminPut(c).(*response.NormalResponse).Status()
 			require.Equal(t, tc.wantStatus, got,
@@ -386,11 +458,9 @@ func TestAdminPut_AcceptedTargetActuallyMatches(t *testing.T) {
 // and the response would report success for the value that was not saved.
 func TestAdminPut_TargetLengthBounded(t *testing.T) {
 	s := newAdminTestService(t)
-	r, b := int64(10), int64(20)
-
 	long := strings.Repeat("u", maxTargetLen+1)
 	c := adminPutCtx(string(KindDatasource), long, UpsertBody{
-		Mode: string(ModeLimited), Rate: &r, Burst: &b,
+		Mode: string(ModeLimited), Rate: rawInt(10), Burst: rawInt(20),
 	})
 	require.Equal(t, 400, s.AdminPut(c).(*response.NormalResponse).Status(),
 		"a target longer than the column must be rejected rather than truncated "+
@@ -398,8 +468,57 @@ func TestAdminPut_TargetLengthBounded(t *testing.T) {
 
 	atLimit := strings.Repeat("u", maxTargetLen)
 	c2 := adminPutCtx(string(KindDatasource), atLimit, UpsertBody{
-		Mode: string(ModeLimited), Rate: &r, Burst: &b,
+		Mode: string(ModeLimited), Rate: rawInt(10), Burst: rawInt(20),
 	})
 	require.Equal(t, 200, s.AdminPut(c2).(*response.NormalResponse).Status(),
 		"a target exactly at the column width must still be accepted")
+}
+
+// TestCeilings_ComeFromConfig pins that the bounds are deployment settings
+// rather than compile-time constants.
+//
+// They were constants, which meant moving a guard rail -- a rare but real
+// operational need -- cost a rebuild and an image roll. They are still not
+// hot-reloadable, and that is deliberate: a ceiling the admin API can raise is
+// not a ceiling, so changing one stays a deploy-time act.
+func TestCeilings_ComeFromConfig(t *testing.T) {
+	// A rule that the shipped default refuses.
+	overDefault := ptr64(DefaultMaxRuleRate + 1)
+	burst := ptr64(DefaultMaxRuleRate + 1)
+
+	shipped := bounds{DefaultMaxRuleRate, DefaultMaxRuleBurst, DefaultMaxRuleConcurrency}
+	require.NotEmpty(t,
+		validateMergedRule(KindUser, ModeLimited, overDefault, burst, nil, shipped),
+		"a value above the configured ceiling must be refused")
+
+	// Same rule, a deployment that raised the bound: now accepted, with no
+	// rebuild involved.
+	raised := bounds{DefaultMaxRuleRate * 10, DefaultMaxRuleBurst * 10, DefaultMaxRuleConcurrency}
+	require.Empty(t,
+		validateMergedRule(KindUser, ModeLimited, overDefault, burst, nil, raised),
+		"raising the ceiling in config must let the same rule through")
+
+	// And the concurrency bound moves independently of the QPS ones.
+	conc := ptr64(DefaultMaxRuleConcurrency + 1)
+	require.NotEmpty(t,
+		validateMergedRule(KindUser, ModeLimited, nil, nil, conc, shipped))
+	require.Empty(t,
+		validateMergedRule(KindUser, ModeLimited, nil, nil, conc,
+			bounds{DefaultMaxRuleRate, DefaultMaxRuleBurst, DefaultMaxRuleConcurrency * 2}))
+}
+
+// TestCeilingSetting_FallsBackRatherThanDisabling covers the case where the
+// ceiling itself is misconfigured.
+//
+// Accepting a bad bound would remove the guard at exactly the moment the config
+// is known to be wrong, so an absent or unusable value falls back to the
+// built-in default instead.
+func TestCeilingSetting_FallsBackRatherThanDisabling(t *testing.T) {
+	lg := log.New("test")
+	require.EqualValues(t, DefaultMaxRuleRate, ceilingSetting(lg, "max_rule_rate", 0, DefaultMaxRuleRate),
+		"an absent ceiling must fall back, not become unlimited")
+	require.EqualValues(t, DefaultMaxRuleRate, ceilingSetting(lg, "max_rule_rate", -5, DefaultMaxRuleRate),
+		"a negative ceiling must fall back")
+	require.EqualValues(t, 2000, ceilingSetting(lg, "max_rule_rate", 2000, DefaultMaxRuleRate),
+		"a usable ceiling must be honoured verbatim")
 }

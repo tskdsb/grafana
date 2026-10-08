@@ -24,7 +24,7 @@ import (
 //  1. Single accounting exit — attempted == allowed + denied at token
 //     granularity, in both live and shadow modes.
 //  2. "First-fail-wins" short-circuit — if the per-user bucket denies,
-//     the lane bucket is never touched (no white-charging of lane tokens).
+//     datasource quota buckets are never touched (no charging of shared capacity).
 //  3. Non-mutating Retry-After — computeRetryAfter uses TokensAt, not
 //     Reserve, so repeated denials don't compound the wait time.
 func (s *Service) Middleware(c *contextmodel.ReqContext) {
@@ -37,15 +37,18 @@ func (s *Service) Middleware(c *contextmodel.ReqContext) {
 	if s == nil {
 		return
 	}
-	if !s.cfg.Enabled {
-		return
-	}
 	// One snapshot for the whole request. Everything below -- the rule, the
 	// baseline it falls back to, and whether a denial is enforced or only
 	// recorded -- must come from the same generation, or a reload landing
 	// mid-request yields a decision that matches no configuration that ever
 	// existed.
 	snap := s.rulesPtr.Load()
+	// Read off the same snapshot as everything else, so the master switch can
+	// be flipped at runtime without a restart and without a request ever
+	// seeing a half-applied generation.
+	if !s.activeQPS(snap) {
+		return
+	}
 	shadow := s.shadowMode(snap)
 	key := rateLimitKey(c)
 	rule := s.resolveRuleIn(snap, key)
@@ -81,7 +84,7 @@ func (s *Service) Middleware(c *contextmodel.ReqContext) {
 	switch Mode(rule.Mode) {
 	case ModeBlocked:
 		metricAttempted.WithLabelValues(dsLabel, kind).Add(1)
-		metricDenied.WithLabelValues(dsLabel, kind, "blocked", enforcedLabel(s.cfg.Enabled && !shadow)).Add(1)
+		metricDenied.WithLabelValues(dsLabel, kind, "blocked", enforcedLabel(s.enforcing(snap))).Add(1)
 		// Throttled per key, exactly like the limited path.
 		//
 		// This used to log every request, on the reasoning that mode=blocked is
@@ -155,6 +158,13 @@ func (s *Service) Middleware(c *contextmodel.ReqContext) {
 	// allowed half would make the metric agree with whatever limit is already
 	// configured and stop being evidence about it.
 	entry.sinceSample.Add(int64(n))
+	if isDsQueryRoute(c) {
+		// Same demand semantics for burst sizing. In shadow mode an over-burst
+		// request is served, and it is exactly the sample the operator needs in
+		// order to raise burst. Recording only outcomeAllowed made the histogram
+		// self-censor at the old burst and systematically hide the expensive tail.
+		metricQueriesPerRequest.Observe(float64(n))
+	}
 
 	outcome := outcomeAllowed
 	denyReason := ""
@@ -240,14 +250,11 @@ func (s *Service) Middleware(c *contextmodel.ReqContext) {
 	metricAttempted.WithLabelValues(dsLabel, kind).Add(float64(n))
 	if outcome == outcomeAllowed {
 		metricAllowed.WithLabelValues(dsLabel, kind, modeLabel).Add(float64(n))
-		if isDsQueryRoute(c) {
-			metricQueriesPerRequest.Observe(float64(n))
-		}
 		return
 	}
-	metricDenied.WithLabelValues(dsLabel, kind, denyReason, enforcedLabel(s.cfg.Enabled && !shadow)).Add(float64(n))
+	metricDenied.WithLabelValues(dsLabel, kind, denyReason, enforcedLabel(s.enforcing(snap))).Add(float64(n))
 
-	// Log the denial. Metrics carry only {lane, kind, reason} — deliberately
+	// Log the denial. Metrics carry only {datasource, kind, reason} — deliberately
 	// no per-identity label, to avoid unbounded cardinality — so this line is
 	// the only place the *identity* of a throttled caller is recorded.
 	//
@@ -405,9 +412,9 @@ func isDsQueryRoute(c *contextmodel.ReqContext) bool {
 // can all fire for one query). Charging len(queries) would therefore
 // under-count by the average fan-out (measured ~1.2x on this deployment,
 // drifting to ~1.5x as dashboard traffic share rises), which is exactly the
-// factor that decouples lane_default_rate from real backend QPS. Counting the
-// flags here keeps `1 token == 1 backend request`, so the lane limit can be
-// derived from the backend quota by plain subtraction and needs no empirical
+// factor that decouples a configured quota from real backend QPS. Counting the
+// flags here keeps `1 token == 1 backend request`, so each datasource limit can
+// be derived from its backend quota by plain subtraction and needs no empirical
 // correction factor.
 //
 // The flag semantics mirror pkg/tsdb/prometheus/models/query.go:98-106
@@ -430,7 +437,7 @@ func isDsQueryRoute(c *contextmodel.ReqContext) bool {
 // countable one, or oversizing the payload becomes a way to buy queries.
 //
 // It is capped at the per-user burst instead of some large round number. A
-// value above the lane burst (420 by default) would exceed the lane bucket and
+// value above a datasource burst would exceed that quota bucket and
 // be refused on every attempt -- permanently, since x/time/rate does not queue
 // -- which would turn this cost decision back into a rejection, exactly what
 // the LimitReader path is written to avoid. Charging the burst makes such a

@@ -73,6 +73,49 @@ const (
 	// ModeUnlimited means observe only. Target is fixed at DefaultTarget --
 	// enforcement is deployment-wide, like shadow_mode itself.
 	KindEnforcement Kind = "enforcement"
+
+	// KindConcurrencyEnforcement is KindEnforcement for the in-flight cap.
+	//
+	// A separate kind rather than a shared one because the two layers are
+	// deliberately independent: the QPS layer may already be enforcing in
+	// production while the in-flight cap is still being trialled, and one row
+	// governing both would mean a concurrency trial can only run by standing
+	// QPS enforcement down. Same reason concurrency_shadow_mode is its own ini
+	// key.
+	//
+	// Same shape as KindEnforcement: ModeLimited enforces, ModeUnlimited
+	// observes, target fixed at DefaultTarget.
+	KindConcurrencyEnforcement Kind = "concurrency_enforcement"
+
+	// KindActivation overrides the ini enabled flag -- the master switch that
+	// decides whether the QPS layer runs at all.
+	//
+	// It is here for the same reason KindEnforcement is: every other knob in
+	// this package became hot-reloadable, and leaving the two master switches
+	// behind meant the one move that recovers from a bad rollout -- turning the
+	// layer off outright -- was also the only one that cost a restart. On a
+	// shared Grafana a restart is a minute of everyone's dashboards failing,
+	// which is a poor price for an operation whose whole point is damage
+	// control.
+	//
+	// ModeLimited means the layer runs, ModeUnlimited means it is bypassed
+	// entirely (no accounting, no metrics, no rejection). Target is fixed at
+	// DefaultTarget: activation is deployment-wide, like the ini key it
+	// overrides.
+	KindActivation Kind = "activation"
+
+	// KindConcurrencyActivation is KindActivation for the in-flight layer.
+	//
+	// Separate for the reason the two enforcement kinds are separate: the two
+	// layers are independently rolled out. Turning concurrency accounting on to
+	// collect the per-identity distribution must not require touching the QPS
+	// layer, and vice versa.
+	//
+	// ModeLimited means in-flight accounting runs, ModeUnlimited means it is
+	// bypassed. Note that accounting running is not the same as rejecting:
+	// whether an over-limit request is refused is still decided by
+	// KindConcurrencyEnforcement and the configured cap.
+	KindConcurrencyActivation Kind = "concurrency_activation"
 )
 
 // DefaultTarget is the only accepted target for KindDefault. A single row means
@@ -85,7 +128,7 @@ const DefaultTarget = "default"
 // can never be matched by resolveRule, so accepting it would only create
 // rows that look effective but are not. KindDefault is the documented
 // exception: it is matched by resolveRule's fallback path, not by byKey.
-var validKinds = []Kind{KindUser, KindSA, KindApiKey, KindAnon, KindLane, KindDatasource, KindDefault, KindEnforcement}
+var validKinds = []Kind{KindUser, KindSA, KindApiKey, KindAnon, KindLane, KindDatasource, KindDefault, KindEnforcement, KindConcurrencyEnforcement, KindActivation, KindConcurrencyActivation}
 
 // ValidKind reports whether k is an accepted rule kind.
 func ValidKind(k string) bool {
@@ -106,13 +149,25 @@ func ValidKinds() []string {
 	return out
 }
 
-// Bounds for admin-supplied rate/burst. The ceiling exists to keep a typo
-// (an extra digit, or a value that overflows int on 32-bit builds) from
-// turning into an effectively unlimited rule; use mode=unlimited for that
-// intent instead. 1e6 QPS is far above any real Grafana deployment.
+// Fallback bounds for admin-supplied rate/burst/concurrency, used when the ini
+// does not state one. The ceiling exists to keep a typo -- an extra digit, or a
+// value that overflows int on 32-bit builds -- from turning into an effectively
+// unlimited rule; use mode=unlimited for that intent instead.
+//
+// These are defaults, not the values in force: the effective bounds come from
+// Config (see conf/defaults.ini), so a deployment can raise or lower them
+// without a rebuild. They are sized to sit clear of any legitimate value rather
+// than to be reachable -- the busiest identity observed runs two orders of
+// magnitude below the rate bound, and an in-flight cap is a single- or
+// double-digit number in practice.
 const (
-	MaxRuleRate  int64 = 1_000_000
-	MaxRuleBurst int64 = 1_000_000
+	DefaultMaxRuleRate  int64 = 1_000
+	DefaultMaxRuleBurst int64 = 1_000
+
+	// DefaultMaxRuleConcurrency is far lower than the QPS ceilings because it
+	// counts requests held open simultaneously: anything near this bound is a
+	// typo rather than a policy.
+	DefaultMaxRuleConcurrency int64 = 100
 )
 
 // maxTargetLen matches the target column width in
@@ -121,16 +176,6 @@ const (
 // for. Datasource UIDs are at most 40 (datasource_mig.go:119), so this only
 // bites on hand-written input.
 const maxTargetLen = 64
-
-// Fallbacks used when conf/defaults.ini carries a nonsensical rate/burst
-// (<= 0, or above the ceiling above). They must stay equal to the MustInt
-// fallbacks in pkg/setting/readDsRateLimitSettings and to the values shipped
-// in conf/defaults.ini; TestConfigFallbacks_MatchSettingDefaults enforces
-// that, so this does not become a third, silently diverging source of truth.
-const (
-	defaultUserRateFallback  = 20
-	defaultUserBurstFallback = 40
-)
 
 // LaneDefault is the historical global-lane target.
 //
@@ -160,15 +205,24 @@ const (
 // Unlimited and Blocked take the fast path in the middleware without
 // ever constructing a rate.Limiter.
 type Rule struct {
-	Id        int64
-	Kind      string
-	Target    string
-	Mode      string
-	Rate      *int64
-	Burst     *int64
-	UpdatedBy *int64
-	Created   time.Time
-	Updated   time.Time
+	Id     int64
+	Kind   string
+	Target string
+	Mode   string
+	Rate   *int64
+	Burst  *int64
+	// Concurrency is the in-flight cap for this identity. Nil means no
+	// override: the caller falls back to the default rule, then to the ini
+	// value, then to no cap at all.
+	//
+	// Separate from Rate/Burst rather than folded into them because the two
+	// layers answer different questions -- how often may this identity ask,
+	// versus how many may be open at once -- and an operator setting one
+	// should not be forced to restate the other.
+	Concurrency *int64
+	UpdatedBy   *int64
+	Created     time.Time
+	Updated     time.Time
 }
 
 // TableName tells xorm the table for this struct.

@@ -1,6 +1,8 @@
 package dsratelimit
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -15,10 +17,61 @@ import (
 )
 
 // UpsertBody is the request body for PUT /api/admin/datasource-rate-limits/:kind/:target.
+// UpsertBody is a partial update: a field carries a new value, clears the
+// stored one when explicitly null, or is absent and leaves it alone.
+//
+// json.RawMessage rather than *int64 because a pointer cannot tell an absent
+// field from an explicit null -- both unmarshal to nil, and those two mean
+// opposite things here.
+//
+// This replaces whole-row replacement, which forced every write to restate
+// every field. That made the common edit -- change a rate, leave the in-flight
+// cap alone -- silently clear the cap, so it needed a guard that refused any
+// write dropping a stored value. The guard could not tell a slip from a
+// deliberate clear, so clearing one field meant deleting the row and writing it
+// back, leaving the identity unlimited in between. Partial update removes the
+// whole chain: omitting a field is a no-op, so there is nothing to slip on and
+// nothing to guard.
 type UpsertBody struct {
-	Mode  string `json:"mode"`
-	Rate  *int64 `json:"rate,omitempty"`
-	Burst *int64 `json:"burst,omitempty"`
+	Mode        string          `json:"mode"`
+	Rate        json.RawMessage `json:"rate,omitempty"`
+	Burst       json.RawMessage `json:"burst,omitempty"`
+	Concurrency json.RawMessage `json:"concurrency,omitempty"`
+}
+
+// fieldUpdate is one field's requested change: absent, cleared, or set.
+type fieldUpdate struct {
+	present bool  // the key appeared in the body
+	clear   bool  // it appeared as null
+	value   int64 // meaningful only when present && !clear
+}
+
+func (f fieldUpdate) apply(stored *int64) *int64 {
+	switch {
+	case !f.present:
+		return stored
+	case f.clear:
+		return nil
+	default:
+		v := f.value
+		return &v
+	}
+}
+
+// parseField reads one field into the three states, rejecting anything that is
+// neither null nor an integer rather than silently treating it as absent.
+func parseField(raw json.RawMessage, name string) (fieldUpdate, error) {
+	if raw == nil {
+		return fieldUpdate{}, nil
+	}
+	if string(raw) == "null" {
+		return fieldUpdate{present: true, clear: true}, nil
+	}
+	var v int64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return fieldUpdate{}, fmt.Errorf("%s must be an integer or null", name)
+	}
+	return fieldUpdate{present: true, value: v}, nil
 }
 
 // notWired reports whether the service is absent (nil receiver), which
@@ -33,7 +86,7 @@ func (s *Service) notWired() response.Response {
 }
 
 // AdminList handles GET /api/admin/datasource-rate-limits.
-// Returns every rule plus a snapshot of each lane's current config.
+// Returns every rule plus the resolved defaults, switches, and datasource quotas.
 func (s *Service) AdminList(c *contextmodel.ReqContext) response.Response {
 	if r := s.notWired(); r != nil {
 		return r
@@ -66,6 +119,108 @@ func (s *Service) AdminGet(c *contextmodel.ReqContext) response.Response {
 		return response.Error(http.StatusNotFound, "rule not found", nil)
 	}
 	return response.JSON(http.StatusOK, r)
+}
+
+// validateMergedRule checks a merged rule and returns an operator-facing reason
+// when it must not be stored, or "" when it may.
+//
+// Pure, and called twice: once in the handler so a bad request is refused
+// before any lock is taken and with a clear message, and again inside
+// upsertPartial after the merge against the locked row. The second call is the
+// one that decides. The first is a courtesy.
+//
+// Both are needed because they answer different questions. The handler knows
+// what the caller asked for; only the transaction knows what the rule will
+// actually become. A reviewer found the gap between them: two requests each
+// changing one half of the QPS pair both validate against the row as it was,
+// then merge in sequence into rate=80 burst=20 -- a pair neither request asked
+// for and neither would have passed. Measured before the fix: 19 of 20
+// concurrent rounds produced an invalid pair, both requests returning 200.
+//
+// That mattered because nothing downstream re-checks it: sanitizeParams
+// verifies positivity and ceilings but not burst >= rate, so the pair reaches
+// rate.NewLimiter(80, 20) and every request costing more than 20 is refused
+// forever.
+// bounds is the set of ceilings a submitted rule is judged against, read from
+// Config so a deployment can move them without a rebuild. Passed explicitly
+// rather than reached through the Service so the validator stays a pure
+// function of its inputs and is testable at any bound.
+type bounds struct {
+	rate        int64
+	burst       int64
+	concurrency int64
+}
+
+func (s *Service) bounds() bounds {
+	return bounds{
+		rate:        s.cfg.MaxRuleRate,
+		burst:       s.cfg.MaxRuleBurst,
+		concurrency: s.cfg.MaxRuleConcurrency,
+	}
+}
+
+// isSwitchKind reports whether a kind is one of the deployment-wide switches,
+// whose only meaningful field is Mode.
+//
+// Kept as one predicate rather than repeated kind comparisons: the list has
+// grown twice, and both times a site that enumerated the kinds inline was
+// missed. validateTarget and this check must agree on what a switch is.
+func isSwitchKind(k Kind) bool {
+	switch k {
+	case KindEnforcement, KindConcurrencyEnforcement, KindActivation, KindConcurrencyActivation:
+		return true
+	}
+	return false
+}
+
+func validateMergedRule(kind Kind, mode Mode, rate, burst, conc *int64, b bounds) string {
+	// The switch kinds carry a decision, not a number: their whole payload is
+	// the mode. Requiring rate/burst from them would make "turn this layer on"
+	// unexpressible -- which is what happened to the activation kinds until a
+	// real PUT was tried against a running server.
+	if mode == ModeLimited && !isSwitchKind(kind) {
+		hasQPS := rate != nil || burst != nil
+		if !hasQPS && conc == nil {
+			return "mode=limited needs rate and burst, a concurrency cap, or both"
+		}
+		if hasQPS && (rate == nil || burst == nil) {
+			return "rate and burst must both be set: sending one alone would leave a " +
+				"rule reloadRules skips. Send both, or null both to clear them"
+		}
+		if rate != nil && burst != nil {
+			// x/time/rate does NOT panic on these (v0.2.0 has no panic path) --
+			// it silently denies forever, which is far harder to diagnose.
+			if *rate <= 0 || *burst <= 0 {
+				return "rate and burst must be positive when mode=limited"
+			}
+			if *rate > b.rate || *burst > b.burst {
+				return fmt.Sprintf("rate must be <= %d and burst must be <= %d",
+					b.rate, b.burst)
+			}
+			if *burst < *rate {
+				return fmt.Sprintf("burst must be >= rate, otherwise a single burst of "+
+					"traffic can never be admitted (merged result: rate=%d burst=%d)",
+					*rate, *burst)
+			}
+		}
+	}
+	if conc != nil {
+		if *conc < 0 {
+			return "concurrency must be >= 0 (0 means no in-flight cap)"
+		}
+		if *conc > b.concurrency {
+			return fmt.Sprintf("concurrency must be <= %d", b.concurrency)
+		}
+		if kind == KindEnforcement || kind == KindDatasource ||
+			kind == KindConcurrencyEnforcement {
+			// Enforcement carries a decision, not a number. A datasource cap
+			// would need a shared counter across identities, which the
+			// in-flight layer does not implement.
+			return "concurrency applies to identity kinds (user, sa, apikey, anon) " +
+				"and to kind=default; it is not supported for " + string(kind)
+		}
+	}
+	return ""
 }
 
 // AdminPut handles PUT /api/admin/datasource-rate-limits/:kind/:target.
@@ -110,6 +265,40 @@ func (s *Service) AdminPut(c *contextmodel.ReqContext) response.Response {
 		return response.Error(http.StatusBadRequest,
 			"mode must be one of: limited, unlimited, blocked", nil)
 	}
+	rateUpd, err := parseField(body.Rate, "rate")
+	if err != nil {
+		return response.Error(http.StatusBadRequest, err.Error(), nil)
+	}
+	burstUpd, err := parseField(body.Burst, "burst")
+	if err != nil {
+		return response.Error(http.StatusBadRequest, err.Error(), nil)
+	}
+	concUpd, err := parseField(body.Concurrency, "concurrency")
+	if err != nil {
+		return response.Error(http.StatusBadRequest, err.Error(), nil)
+	}
+
+	// The stored row is read before validation, not after, because a partial
+	// body is only meaningful against it: "rate=30" alone is valid when a burst
+	// is already stored and invalid when it is not. Validating the body in
+	// isolation would accept the second case and store a rule that
+	// reloadRules silently skips.
+	//
+	// A read error stops the write. Continuing as if the row were absent would
+	// turn every omitted field into a clear -- the exact data loss this design
+	// exists to prevent.
+	before, err := s.store.get(c.Req.Context(), kind, target)
+	if err != nil {
+		return response.Error(http.StatusInternalServerError,
+			"failed to read the existing rule", err)
+	}
+	var storedRate, storedBurst, storedConc *int64
+	if before != nil {
+		storedRate, storedBurst, storedConc = before.Rate, before.Burst, before.Concurrency
+	}
+	finalRate := rateUpd.apply(storedRate)
+	finalBurst := burstUpd.apply(storedBurst)
+	finalConc := concUpd.apply(storedConc)
 	// A datasource quota accepts rate/burst only. reloadRules skips any
 	// datasource row without both values, so accepting blocked/unlimited here
 	// would return 200 and list the rule back while the quota stayed as it was
@@ -137,69 +326,65 @@ func (s *Service) AdminPut(c *contextmodel.ReqContext) response.Response {
 				"per-identity limiting for all of them. Use the enabled or "+
 				"shadow_mode setting to turn enforcement off globally", nil)
 	}
-	// Enforcement carries its decision in Mode alone: limited = enforce,
-	// unlimited = observe. It takes no rate/burst, so it must be handled before
-	// the mode=limited branch below, which requires them.
-	if Kind(kind) == KindEnforcement {
+	// All four switches carry their decision in Mode alone. The enforcement
+	// kinds already rejected rate/burst, but the two activation kinds accepted
+	// and persisted rate/burst/concurrency that reloadRules then ignores: the
+	// PUT returned 200 and the operator believed a limit was set when only the
+	// switch moved. A switch that takes numbers has to reject them all.
+	if isSwitchKind(Kind(kind)) {
+		if rateUpd.present || burstUpd.present || concUpd.present {
+			return response.Error(http.StatusBadRequest,
+				"switch rules take mode only (limited/unlimited), not rate/burst/concurrency; "+
+					"set those on kind=default or on a specific identity", nil)
+		}
 		switch Mode(body.Mode) {
 		case ModeLimited, ModeUnlimited:
 		default:
 			return response.Error(http.StatusBadRequest,
-				"enforcement rules accept mode=limited (enforce) or "+
-					"mode=unlimited (observe only)", nil)
-		}
-		if body.Rate != nil || body.Burst != nil {
-			return response.Error(http.StatusBadRequest,
-				"enforcement rules take no rate/burst; they switch enforcement on "+
-					"or off. Use kind=default to change the baseline limit", nil)
-		}
-	} else if Mode(body.Mode) == ModeLimited {
-		if body.Rate == nil || body.Burst == nil {
-			return response.Error(http.StatusBadRequest,
-				"rate and burst are required when mode=limited", nil)
-		}
-		// Non-positive or oversized values are rejected at the only write
-		// entry point. x/time/rate does NOT panic on them (v0.2.0 has no
-		// panic path) — it silently denies forever, which is far harder to
-		// diagnose. See sanitizeParams in ratelimit.go.
-		if *body.Rate <= 0 || *body.Burst <= 0 {
-			return response.Error(http.StatusBadRequest,
-				"rate and burst must be positive when mode=limited", nil)
-		}
-		if *body.Rate > MaxRuleRate || *body.Burst > MaxRuleBurst {
-			return response.Error(http.StatusBadRequest, fmt.Sprintf(
-				"rate must be <= %d and burst must be <= %d", MaxRuleRate, MaxRuleBurst), nil)
-		}
-		if *body.Burst < *body.Rate {
-			return response.Error(http.StatusBadRequest,
-				"burst must be >= rate, otherwise a single burst of traffic can never be admitted", nil)
+				"switch rules accept mode=limited or mode=unlimited only", nil)
 		}
 	}
 
-	before, _ := s.store.get(c.Req.Context(), kind, target)
+	// Advisory check: refuses an obviously bad request before any lock is taken.
+	// The authoritative one runs inside upsertPartial, against the row it locks
+	// -- this one cannot see what a concurrent write is about to do.
+	if msg := validateMergedRule(Kind(kind), Mode(body.Mode),
+		finalRate, finalBurst, finalConc, s.bounds()); msg != "" {
+		return response.Error(http.StatusBadRequest, msg, nil)
+	}
+
 	actorID := c.UserID
 
-	r := &Rule{
-		Kind:      kind,
-		Target:    target,
-		Mode:      body.Mode,
-		Rate:      body.Rate,
-		Burst:     body.Burst,
-		UpdatedBy: &actorID,
-	}
-	if err := s.store.upsert(c.Req.Context(), r); err != nil {
+	// The merge above was for validation. What gets written is merged again
+	// inside upsertPartial, against the row it locks -- otherwise two writers
+	// each changing a different field would both succeed and the later one
+	// would silently revert the earlier.
+	written, err := s.store.upsertPartial(c.Req.Context(), kind, target, body.Mode,
+		&actorID, rateUpd, burstUpd, concUpd,
+		func(rate, burst, conc *int64) string {
+			return validateMergedRule(Kind(kind), Mode(body.Mode), rate, burst, conc, s.bounds())
+		})
+	if err != nil {
+		// A merge that validated on its own but not against the row as locked.
+		// The caller asked for something reasonable, so this is a 400 with the
+		// reason rather than a 500: reissuing the request usually succeeds,
+		// since it will then merge against the row the other write left.
+		var invalid *ErrInvalidMergedRule
+		if errors.As(err, &invalid) {
+			return response.Error(http.StatusBadRequest, invalid.Reason, nil)
+		}
 		return response.Error(http.StatusInternalServerError, "failed to upsert rule", err)
 	}
 
 	s.logger.Info("dsratelimit rule upserted",
 		"actor", c.Login, "actor_id", actorID,
 		"kind", kind, "target", target,
-		"before", ruleDigest(before), "after", ruleDigest(r))
+		"before", ruleDigest(before), "after", ruleDigest(written))
 
 	if err := s.reloadRules(c.Req.Context()); err != nil {
 		s.logger.Error("post-upsert reload failed; next 30s tick will retry", "err", err)
 	}
-	return response.JSON(http.StatusOK, r)
+	return response.JSON(http.StatusOK, written)
 }
 
 // AdminDelete handles DELETE /api/admin/datasource-rate-limits/:kind/:target.
@@ -212,7 +397,11 @@ func (s *Service) AdminDelete(c *contextmodel.ReqContext) response.Response {
 	if kind == "" || target == "" {
 		return response.Error(http.StatusBadRequest, "kind and target are required", nil)
 	}
-	before, _ := s.store.get(c.Req.Context(), kind, target)
+	// Do not delete a rule when its audit pre-image could not be read.
+	before, err := s.store.get(c.Req.Context(), kind, target)
+	if err != nil {
+		return response.Error(http.StatusInternalServerError, "failed to read the existing rule", err)
+	}
 	if err := s.store.delete(c.Req.Context(), kind, target); err != nil {
 		return response.Error(http.StatusInternalServerError, "failed to delete rule", err)
 	}
@@ -227,7 +416,7 @@ func (s *Service) AdminDelete(c *contextmodel.ReqContext) response.Response {
 }
 
 // AdminStats handles GET /api/admin/datasource-rate-limits/stats.
-// Returns live lane token levels plus active-key count. Prometheus counters
+// Returns live datasource quota levels plus active-key count. Prometheus counters
 // (attempted/allowed/denied) are exposed on /metrics; this endpoint is for
 // quick human introspection during triage.
 func (s *Service) AdminStats(c *contextmodel.ReqContext) response.Response {
@@ -245,11 +434,24 @@ func (s *Service) AdminStats(c *contextmodel.ReqContext) response.Response {
 	if snap != nil && snap.shadow != nil {
 		shadowSource = "db"
 	}
+	// The baseline in-flight cap and where it came from. Resolved through the
+	// same function the middleware uses, with a key that matches no rule, so
+	// what is reported is what an identity without its own override receives.
+	concLimit := s.concurrencyLimit(snap, "")
+	concSource := "ini"
+	if snap != nil && snap.defaultConcurrency != nil {
+		concSource = "db"
+	}
+	concShadow := s.concurrencyShadowMode(snap)
+	concShadowSource := "ini"
+	if snap != nil && snap.concurrencyShadow != nil {
+		concShadowSource = "db"
+	}
 	return response.JSON(http.StatusOK, map[string]any{
 		"datasources": s.datasourceStatusSnapshot(now),
 		"active_keys": s.userCount.Load(),
 		"shadow_mode": s.shadowMode(snap),
-		"enabled":     s.cfg.Enabled,
+		"enabled":     s.activeQPS(snap),
 		// Whether requests are actually being rejected right now. shadow_mode
 		// alone does not answer that -- enabled=false also means "not
 		// enforcing" -- and with both now readable from two sources, an
@@ -266,14 +468,20 @@ func (s *Service) AdminStats(c *contextmodel.ReqContext) response.Response {
 		// says whether requests are being rejected, not three they have to
 		// combine correctly.
 		"concurrency": map[string]any{
-			"enabled":     s.cfg.ConcurrencyEnabled,
-			"shadow_mode": s.cfg.ConcurrencyShadowMode,
-			"limit":       s.cfg.DefaultUserConcurrency,
-			"enforcing": s.cfg.Enabled && s.cfg.ConcurrencyEnabled &&
-				!s.cfg.ConcurrencyShadowMode && s.cfg.DefaultUserConcurrency > 0,
+			"enabled":            s.activeConcurrency(snap),
+			"shadow_mode":        concShadow,
+			"shadow_mode_source": concShadowSource,
+			// The limit actually in force for an identity with no rule of its
+			// own, and which source won. Reporting s.cfg here would have been
+			// wrong from the moment the DB override landed: an operator who
+			// raises the default at runtime would still see the ini number and
+			// conclude the change did not apply.
+			"limit":        concLimit,
+			"limit_source": concSource,
+			"enforcing":    s.concurrencyEnforcing(snap, concLimit),
 			// Counting is what the observation week depends on, and it needs
 			// less than enforcing does: a limit of zero still records.
-			"recording": s.cfg.Enabled && s.cfg.ConcurrencyEnabled,
+			"recording": s.activeConcurrency(snap),
 		},
 		"sources": map[string]any{
 			"shadow_mode": shadowSource,
@@ -398,14 +606,21 @@ func validateTarget(kind Kind, target string) string {
 					"default); %q would be saved but never take effect",
 				DefaultTarget, target)
 		}
-	case KindEnforcement:
-		// Enforcement is deployment-wide, same as the shadow_mode setting it
-		// overrides.
+	case KindEnforcement, KindConcurrencyEnforcement, KindActivation, KindConcurrencyActivation:
+		// All four are deployment-wide switches, same as the ini keys they
+		// override, so exactly one row of each may exist.
+		//
+		// The activation kinds need this as much as the enforcement ones, and
+		// for a sharper reason: reloadRules keys these off r.Kind and ignores
+		// r.Target, so a row stored under a mistyped target is not inert -- it
+		// is applied deployment-wide. Two rows disagreeing would then resolve
+		// by whichever store.list happened to return last, since it does no
+		// ordering. Rejecting the write is what keeps "one switch" true.
 		if target != DefaultTarget {
 			return fmt.Sprintf(
-				"target for kind=enforcement must be %q (enforcement is "+
-					"deployment-wide); %q would be saved but never take effect",
-				DefaultTarget, target)
+				"target for kind=%s must be %q (this switch is deployment-wide); "+
+					"%q would be stored as a second, conflicting switch row",
+				kind, DefaultTarget, target)
 		}
 	default:
 		// KindLane only. It is still in validKinds so an old caller gets a 400

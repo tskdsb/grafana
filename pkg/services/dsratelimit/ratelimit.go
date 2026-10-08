@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
 
 	"github.com/grafana/grafana/pkg/infra/db"
@@ -47,6 +48,16 @@ type rulesSnapshot struct {
 	// restores the deployed baseline, same as for a datasource quota.
 	defaults *laneParams
 
+	// defaultConcurrency, when non-nil, overrides the ini
+	// default_user_concurrency. Separate from defaults because the two can be
+	// set independently: an operator tuning the in-flight cap during the
+	// observation window should not have to restate the QPS pair to do it.
+	//
+	// nil means the ini value applies. Zero or negative, from either source,
+	// means no cap -- the same "unconfigured is unlimited" rule the QPS layer
+	// follows, so neither layer can be armed by omission.
+	defaultConcurrency *int64
+
 	// shadow, when non-nil, overrides the ini shadow_mode. Going from observing
 	// to enforcing (and back, if enforcement turns out to hurt) is the single
 	// most time-critical switch this package has, and requiring a restart for it
@@ -54,6 +65,28 @@ type rulesSnapshot struct {
 	//
 	// nil means the ini value applies, same convention as defaults.
 	shadow *bool
+
+	// concurrencyShadow, when non-nil, overrides the ini
+	// concurrency_shadow_mode. Separate from shadow for the same reason the
+	// two ini keys are separate: the QPS layer may already be enforcing while
+	// the in-flight cap is still observing, and a single switch would make a
+	// concurrency trial require standing QPS enforcement down.
+	//
+	// nil means the ini value applies, same convention as the others.
+	concurrencyShadow *bool
+
+	// active / concurrencyActive, when non-nil, override the ini enabled and
+	// concurrency_enabled master switches. Same nil-means-ini convention as
+	// every other field here.
+	//
+	// These exist so that no knob in this package requires a restart. The
+	// master switches were the last two holdouts, and they were the worst ones
+	// to leave behind: turning a layer off is what an operator reaches for when
+	// something is going wrong, and that is the moment a restart is least
+	// affordable -- on a shared Grafana it fails everyone's dashboards for a
+	// minute.
+	active            *bool
+	concurrencyActive *bool
 }
 
 type laneParams struct {
@@ -179,14 +212,10 @@ func ProvideService(cfg *setting.Cfg, dbConn db.DB) *Service {
 	}
 	// Seed from the ini so the deployed quotas are in force from the first
 	// request, before the first DB reload has run (and even if the DB is
-	// unreachable). rulesPtr must also never be nil for Load().
-	// Config is the only source until the first DB reload lands, so this
-	// publishes the ini state; reloadRules re-publishes it whenever a DB
-	// override changes it. It answers "is the limiter actually enforcing right
-	// now?" from a dashboard, which matters because shadow mode is the default
-	// -- "we thought it was on" is a realistic way to find out a backend was
-	// never protected.
-	s.publishEnforcing(nil)
+	// unreachable). rulesPtr must also never be nil for Load(). Publish the
+	// complete ini-derived runtime state at the same point: if the initial DB
+	// load fails, the gauges still describe the baseline the request path uses.
+	s.publishRuntimeConfig(nil)
 
 	s.rulesPtr.Store(&rulesSnapshot{
 		byKey:    map[string]*Rule{},
@@ -204,34 +233,44 @@ func ProvideService(cfg *setting.Cfg, dbConn db.DB) *Service {
 // Config, sanitising the four rate/burst numbers on the way through.
 //
 // setting.MustInt only supplies a fallback when a key is absent or unparseable;
-// an explicit `lane_default_rate = -5` is passed through verbatim. Reaching
+// an explicit `default_user_rate = -5` is passed through verbatim. Reaching
 // rate.NewLimiter, such a value produces a limiter whose tokens never recover
 // (x/time/rate v0.2.0 has no panic path — see sanitizeParams), so a single
 // mistyped line silently rejects every datasource query in the deployment.
 //
 // This is the one place all four values cross into the service, so guarding it
-// covers both the lane bucket built in ProvideService and the per-user
+// covers both per-datasource quota configuration and the per-user
 // defaults. Note the per-user path was already protected: resolveRule wraps the
 // config values in a Rule, which getUserEntry runs through sanitizeParams. The
-// lane bucket had no equivalent, which is exactly the asymmetry fixed here.
+// datasource quota path had no equivalent, which is exactly the asymmetry fixed here.
 //
-// Invalid values fall back to the built-in defaults rather than disabling the
-// limiter: a typo should not silently remove the protection either. Each
-// fallback is logged with the offending key and value, and counted in
-// invalid_rule_total, so it cannot pass unnoticed.
+// Invalid or incomplete values disarm that layer instead of inventing a limit
+// nobody chose. Each ignored value is logged and counted in invalid_rule_total,
+// so the fail-open decision remains visible.
 func loadConfigFromSetting(cfg *setting.Cfg) Config {
 	logger := log.New("dsratelimit")
-	sane := func(key string, got, fallback int) int {
-		if got > 0 && int64(got) <= MaxRuleRate {
-			return got
-		}
-		logger.Warn("invalid datasource_ratelimit setting; falling back to built-in default",
-			"key", key, "configured", got, "using", fallback,
-			"why", "rate/burst must be > 0 and <= MaxRuleRate; other values make "+
-				"x/time/rate reject every request without recovering")
-		metricInvalidRule.Inc()
-		return fallback
-	}
+	// An unusable configured value disarms the layer instead of substituting a
+	// number nobody chose.
+	//
+	// This used to fall back to the built-in 20/40. That turned a typo into a
+	// limit: an operator who wrote default_user_rate = 2O (letter O) got a
+	// working limiter at someone else's number, with only a log line to say
+	// so. And the reverse case was worse -- a zero reached x/time/rate, which
+	// has no "unlimited" value and reads zero as refuse-everything, so a
+	// missing number took the query API down entirely.
+	//
+	// Both failures came from treating an absent or broken value as if it
+	// expressed an intention. It does not. Returning 0 here means the layer
+	// stays out of the way until someone states a real number, through the ini
+	// or through the admin API.
+	// Bounds first: everything validated below is judged against them, so they
+	// have to be resolved before any value is checked. A non-positive or absent
+	// setting falls back to the built-in default rather than disabling the
+	// check -- a ceiling that omission can switch off is not a ceiling.
+	maxRate := ceilingSetting(logger, "max_rule_rate", cfg.DsRateLimit.MaxRuleRate, DefaultMaxRuleRate)
+	maxBurst := ceilingSetting(logger, "max_rule_burst", cfg.DsRateLimit.MaxRuleBurst, DefaultMaxRuleBurst)
+	maxConc := ceilingSetting(logger, "max_rule_concurrency", cfg.DsRateLimit.MaxRuleConcurrency, DefaultMaxRuleConcurrency)
+
 	// Deploy-time quotas get the same treatment as the rest of the ini: a bad
 	// value is dropped with a reason, never applied. Dropping rather than
 	// falling back to some default is the only honest option here -- there is no
@@ -242,7 +281,7 @@ func loadConfigFromSetting(cfg *setting.Cfg) Config {
 		if uid == "" {
 			continue
 		}
-		lp, ok := sanitizeParams(int64(q.Rate), int64(q.Burst))
+		lp, ok := sanitizeParams(int64(q.Rate), int64(q.Burst), maxRate, maxBurst)
 		// burst >= rate is required here for the same reason AdminPut requires
 		// it: the two paths configure the same thing, and a value the API
 		// rejects must not be silently accepted just because it arrived via the
@@ -267,31 +306,124 @@ func loadConfigFromSetting(cfg *setting.Cfg) Config {
 		iniQuotas[uid] = lp
 	}
 
+	// rate and burst are judged as a pair, not one at a time.
+	//
+	// AdminPut rejects burst < rate; the ini path did not, so the same numbers
+	// were refused through the API and accepted from the file. Measured with
+	// rate=100 burst=2: a five-token request was denied ten times out of ten
+	// and would never succeed, because x/time/rate refuses any cost above
+	// burst outright (rate.go:371) no matter how many tokens have accumulated.
+	//
+	// One entry point may not be stricter than another about the same setting.
+	// Disarming is the honest outcome here, as everywhere else in this
+	// function: the pair as written cannot serve traffic, so enforcing it
+	// would only convert a typo into an outage.
+	iniRate := saneSetting(logger, "default_user_rate", cfg.DsRateLimit.DefaultUserRate, maxRate)
+	iniBurst := saneSetting(logger, "default_user_burst", cfg.DsRateLimit.DefaultUserBurst, maxBurst)
+	if iniRate > 0 && iniBurst > 0 && iniBurst < iniRate {
+		logger.Warn("default_user_burst is below default_user_rate; this layer will "+
+			"not limit until the pair is fixed",
+			"default_user_rate", iniRate, "default_user_burst", iniBurst,
+			"why", "x/time/rate refuses any single request costing more than burst, "+
+				"permanently and regardless of accumulated tokens, so the configured "+
+				"rate is not actually reachable. The admin API rejects this pair; "+
+				"accepting it here would make the file the laxer of the two")
+		metricInvalidRule.Inc()
+		iniRate, iniBurst = 0, 0
+	}
+
 	return Config{
 		Enabled:          cfg.DsRateLimit.Enabled,
 		ShadowMode:       cfg.DsRateLimit.ShadowMode,
-		DefaultUserRate:  sane("default_user_rate", cfg.DsRateLimit.DefaultUserRate, defaultUserRateFallback),
-		DefaultUserBurst: sane("default_user_burst", cfg.DsRateLimit.DefaultUserBurst, defaultUserBurstFallback),
+		DefaultUserRate:  iniRate,
+		DefaultUserBurst: iniBurst,
 		IniQuotas:        iniQuotas,
 		CacheMaxEntries:  cfg.DsRateLimit.CacheMaxEntries,
 
 		ConcurrencyEnabled: cfg.DsRateLimit.ConcurrencyEnabled,
-		// Not run through sane(): unlike rate and burst, where zero would
-		// silently deny every request, zero here is the meaningful default of
-		// "no cap". Substituting a fallback would turn an explicit
-		// default_user_concurrency = 0 into a limit nobody asked for.
-		DefaultUserConcurrency: cfg.DsRateLimit.DefaultUserConcurrency,
-		ConcurrencyShadowMode:  cfg.DsRateLimit.ConcurrencyShadowMode,
+		// Not run through sane(), which is built around the rate/burst pair.
+		// Zero or negative already means "no cap" to acquire(), so the only
+		// value worth rejecting is one too large to be a real policy -- and
+		// AdminPut rejects those, so the ini must too.
+		DefaultUserConcurrency: saneSetting(logger, "default_user_concurrency",
+			cfg.DsRateLimit.DefaultUserConcurrency, maxConc),
+		ConcurrencyShadowMode: cfg.DsRateLimit.ConcurrencyShadowMode,
+		MaxRuleRate:           maxRate,
+		MaxRuleBurst:          maxBurst,
+		MaxRuleConcurrency:    maxConc,
 	}
 }
+
+// saneSetting judges one configured limit, for either layer.
+//
+// One function rather than one per layer, because the two used to answer the
+// same question differently and nobody noticed until they were listed side by
+// side. Sharing the implementation makes that drift impossible; the layers
+// differ only in the bounds they pass.
+//
+//	<= 0       no limit. Zero means "not configured", negative can only be a
+//	           typo, and both describe an operator who has not stated a limit.
+//	           Silent: the shipped default is zero and an observation window
+//	           runs in exactly this state.
+//	> ceiling  no limit, with a warning. The value cannot be applied safely --
+//	           for QPS it would reach x/time/rate, which has no "unlimited"
+//	           and would refuse everything.
+//
+// Anything in between is applied as written. A separate "looks like a typo"
+// tier was built here and removed: measured, a value just under the ceiling
+// and a value just over it both admitted all fifty probe requests, because a
+// limit of 999999 never binds either. Warning about a number that changes
+// nothing is noise, and the tier cost an ini key, a metric and a second
+// threshold to say what the ceiling already said.
+func saneSetting(logger log.Logger, key string, got int, ceiling int64) int {
+	v := int64(got)
+	if v <= 0 {
+		return 0
+	}
+	if v > ceiling {
+		logger.Warn("datasource_ratelimit setting is out of range; this layer will not "+
+			"limit until a usable value is set",
+			"key", key, "configured", got, "max", ceiling,
+			"why", "a value this large cannot be applied safely, and substituting a "+
+				"built-in number would enforce a limit nobody chose")
+		metricInvalidRule.Inc()
+		return 0
+	}
+	return got
+}
+
+// ceilingSetting resolves one configured bound, falling back to the built-in
+// default when the ini omits it or states something unusable.
+//
+// Falling back rather than accepting is the point: a ceiling exists to catch a
+// typo, so letting a typo in the ceiling itself disable the check would remove
+// the guard exactly when the config is already known to be wrong.
+func ceilingSetting(logger log.Logger, key string, got int, fallback int64) int64 {
+	if got <= 0 {
+		return fallback
+	}
+	v := int64(got)
+	if v > maxSafeInt {
+		logger.Warn("datasource_ratelimit ceiling is out of range; using the built-in default",
+			"key", key, "configured", got, "default", fallback)
+		metricInvalidRule.Inc()
+		return fallback
+	}
+	return v
+}
+
+// maxSafeInt is the largest int64 that survives conversion to int on a 32-bit
+// build, where x/time/rate's int-typed burst would otherwise wrap negative.
+const maxSafeInt = int64(^uint32(0) >> 1)
 
 // Run implements registry.BackgroundService: reload + cleanup goroutines.
 // Blocks until ctx is cancelled.
 func (s *Service) Run(ctx context.Context) error {
-	if !s.cfg.Enabled {
-		<-ctx.Done()
-		return nil
-	}
+	// Deliberately NOT gated on the master switch. The reload loop is what
+	// makes the switch hot: parking here when the ini ships enabled=false
+	// would mean the DB override could never be read, so turning the layer on
+	// at runtime would silently do nothing and the only way back would be the
+	// restart this design exists to avoid. The loop is one query every 30s.
 	reloadTick := time.NewTicker(30 * time.Second)
 	cleanupTick := time.NewTicker(5 * time.Minute)
 	sampleTick := time.NewTicker(userRateSampleInterval)
@@ -351,7 +483,7 @@ func (s *Service) sampleUserRates() {
 }
 
 // reloadRules pulls all rules from DB and swaps in a fresh snapshot.
-// The default lane bucket is also refreshed here (SetLimit/SetBurst).
+// Existing datasource quota buckets are refreshed below (SetLimit/SetBurst).
 func (s *Service) reloadRules(ctx context.Context) error {
 	rules, err := s.store.list(ctx)
 	if err != nil {
@@ -389,7 +521,7 @@ func (s *Service) reloadRules(ctx context.Context) error {
 					"target", r.Target, "mode", r.Mode)
 				continue
 			}
-			lp, ok := sanitizeParams(*r.Rate, *r.Burst)
+			lp, ok := sanitizeParams(*r.Rate, *r.Burst, s.cfg.MaxRuleRate, s.cfg.MaxRuleBurst)
 			if !ok {
 				// Ignore the row rather than apply it. A bad row can predate
 				// admin-API validation or come from a direct DB edit; applying
@@ -407,16 +539,41 @@ func (s *Service) reloadRules(ctx context.Context) error {
 		}
 
 		if r.Kind == string(KindDefault) {
+			// A default row may carry the QPS pair, the in-flight cap, or
+			// both. They are applied independently: setting one must not
+			// require restating the other, and an invalid half must not
+			// discard the valid half.
+			if r.Concurrency != nil {
+				switch {
+				case *r.Concurrency < 0:
+					metricInvalidRule.Inc()
+					s.logger.Warn("ignoring negative default concurrency; keeping the configured baseline",
+						"concurrency", *r.Concurrency,
+						"baseline", s.cfg.DefaultUserConcurrency)
+				default:
+					// Zero is kept, not rejected: it is how an operator turns
+					// the cap off at runtime without a restart, and it reads
+					// the same as an unset ini value.
+					v := *r.Concurrency
+					snap.defaultConcurrency = &v
+				}
+			}
+
 			// Same shape as a datasource quota: only a rate/burst pair means
 			// anything. blocked/unlimited as a global default would let one
 			// write disable limiting (or lock everyone out) for the whole
 			// deployment, which is what the master switch is for.
 			if r.Mode != string(ModeLimited) || r.Rate == nil || r.Burst == nil {
-				s.logger.Warn("ignoring default rule without a rate/burst pair",
-					"mode", r.Mode)
+				// Not a warning when the row exists only to carry a
+				// concurrency value -- that is a supported shape, not a
+				// malformed rule.
+				if r.Concurrency == nil {
+					s.logger.Warn("ignoring default rule without a rate/burst pair",
+						"mode", r.Mode)
+				}
 				continue
 			}
-			lp, ok := sanitizeParams(*r.Rate, *r.Burst)
+			lp, ok := sanitizeParams(*r.Rate, *r.Burst, s.cfg.MaxRuleRate, s.cfg.MaxRuleBurst)
 			if !ok {
 				// Ignoring it leaves the ini baseline in force. Applying it
 				// would deny every request from every identity that has no
@@ -430,6 +587,48 @@ func (s *Service) reloadRules(ctx context.Context) error {
 				continue
 			}
 			snap.defaults = &lp
+			continue
+		}
+
+		if r.Kind == string(KindConcurrencyEnforcement) {
+			// Same decoding as KindEnforcement below, against the in-flight
+			// cap's own switch.
+			switch Mode(r.Mode) {
+			case ModeLimited:
+				v := false
+				snap.concurrencyShadow = &v
+			case ModeUnlimited:
+				v := true
+				snap.concurrencyShadow = &v
+			default:
+				s.logger.Warn("ignoring concurrency enforcement rule with an unusable "+
+					"mode; keeping the configured concurrency_shadow_mode",
+					"mode", r.Mode, "concurrency_shadow_mode", s.cfg.ConcurrencyShadowMode)
+			}
+			continue
+		}
+
+		if r.Kind == string(KindActivation) || r.Kind == string(KindConcurrencyActivation) {
+			// ModeLimited = the layer runs, ModeUnlimited = bypassed. Same
+			// encoding as the enforcement kinds, so there is one convention to
+			// learn rather than two.
+			var v bool
+			switch Mode(r.Mode) {
+			case ModeLimited:
+				v = true
+			case ModeUnlimited:
+				v = false
+			default:
+				s.logger.Warn("ignoring activation rule with an unusable mode; "+
+					"keeping the configured value",
+					"kind", r.Kind, "mode", r.Mode)
+				continue
+			}
+			if r.Kind == string(KindActivation) {
+				snap.active = &v
+			} else {
+				snap.concurrencyActive = &v
+			}
 			continue
 		}
 
@@ -455,11 +654,10 @@ func (s *Service) reloadRules(ctx context.Context) error {
 		snap.byKey[r.Kind+":"+r.Target] = r
 	}
 	s.rulesPtr.Store(snap)
-	// Enforcement can now change without a restart, so the gauge has to be
-	// re-published on every reload rather than set once at startup. A dashboard
-	// that says "shadow" while the limiter is rejecting traffic is worse than no
-	// gauge at all.
-	s.publishEnforcing(snap)
+	// Defaults and switches can change without a restart. Republish the
+	// resolved values after every atomic snapshot swap so the dashboard reads
+	// the same generation the request path does.
+	s.publishRuntimeConfig(snap)
 	// Snapshot freshness. fail_open_total counts reload failures, but a counter
 	// cannot say how stale the in-memory config is: after a failure the service
 	// keeps serving the previous snapshot indefinitely, so an admin API change
@@ -509,12 +707,55 @@ func (s *Service) resolveRule(key string) *Rule {
 // configured -- e.g. the new limit judged with the old enforcement setting.
 func (s *Service) resolveRuleIn(snap *rulesSnapshot, key string) *Rule {
 	if r, ok := snap.byKey[key]; ok {
+		// A stored rule may carry only a concurrency value: the admin API
+		// accepts that deliberately, so tuning the in-flight cap does not
+		// force an operator to restate QPS numbers.
+		//
+		// Such a rule says nothing about QPS, so QPS must fall back exactly as
+		// it does for an identity with no rule at all. Returning it unchanged
+		// left Mode=limited with Rate=nil, which getUserEntry then filled from
+		// an unconfigured baseline -- rate.NewLimiter(0, 0), which refuses
+		// everything. Measured: an identity given a concurrency cap of 5 was
+		// denied ten requests out of ten while an identity with no rule was
+		// served. Adding a limit on one layer disabled the other.
+		//
+		// That is the same defect this change set exists to remove, reached
+		// through a path added by the same change set -- which is why the
+		// fallback is now one function called from both places rather than a
+		// branch here and a matching branch there.
+		if Mode(r.Mode) == ModeLimited && r.Rate == nil && r.Burst == nil {
+			return s.baselineRule(snap)
+		}
 		return r
 	}
 	if keyKind(key) == string(KindAnon) {
 		return &Rule{Mode: string(ModeBlocked)}
 	}
+	return s.baselineRule(snap)
+}
+
+// baselineRule is the QPS rule for an identity that has not been given one.
+//
+// Reached from two places -- an identity with no stored rule, and one whose
+// stored rule sets only a concurrency cap. Both mean "nobody has stated a QPS
+// limit for this identity", so both must resolve identically; keeping the
+// logic here rather than at each call site is what makes that true by
+// construction.
+//
+// No configured baseline means no limit, not a limit of zero. This used to
+// return ModeLimited with rate=0, which x/time/rate reads as "refuse
+// everything": an operator who set enabled=true but never filled in
+// default_user_rate took the whole query API down. Measured before the change
+// -- twenty requests against an unconfigured default, twenty refusals.
+//
+// An absent number is an operator who has not decided yet, and the only safe
+// reading of "not decided" is to stay out of the way. The same rule governs
+// the in-flight cap, so neither layer can be armed by omission.
+func (s *Service) baselineRule(snap *rulesSnapshot) *Rule {
 	r, b := s.defaultParams(snap)
+	if r <= 0 || b <= 0 {
+		return &Rule{Mode: string(ModeUnlimited)}
+	}
 	return &Rule{Mode: string(ModeLimited), Rate: &r, Burst: &b}
 }
 
@@ -546,20 +787,90 @@ func (s *Service) shadowMode(snap *rulesSnapshot) bool {
 	return s.cfg.ShadowMode
 }
 
+// concurrencyShadowMode is shadowMode for the in-flight cap: DB override
+// first, ini second.
+//
+// Every decision that depends on it must come through here rather than
+// reading s.cfg, for the same reason shadowMode exists -- a request that
+// takes its limit from the snapshot and its enforcement flag from the config
+// can observe a combination that was never configured.
+func (s *Service) concurrencyShadowMode(snap *rulesSnapshot) bool {
+	if snap != nil && snap.concurrencyShadow != nil {
+		return *snap.concurrencyShadow
+	}
+	return s.cfg.ConcurrencyShadowMode
+}
+
 // enforcing is the positive form, for the metric and for /stats. Kept as its own
 // method so that "enabled but shadowed" cannot be spelled two different ways in
 // two places.
 func (s *Service) enforcing(snap *rulesSnapshot) bool {
-	return s.cfg.Enabled && !s.shadowMode(snap)
+	return s.activeQPS(snap) && !s.shadowMode(snap)
 }
 
-// publishEnforcing mirrors the current enforcement state into the gauge.
-func (s *Service) publishEnforcing(snap *rulesSnapshot) {
-	if s.enforcing(snap) {
-		metricEnforcing.Set(1)
-	} else {
-		metricEnforcing.Set(0)
+// concurrencyEnforcing is enforcing() for the in-flight layer, and
+// deliberately does NOT gate on activeQPS. The two layers are independently
+// switchable: gating concurrency on the QPS switch meant turning the QPS layer
+// off silently disabled concurrency counting and rejection, so the two
+// "independent" rollouts were secretly coupled. Whether concurrency runs is
+// decided solely by its own activation + shadow + a positive cap.
+func (s *Service) concurrencyEnforcing(snap *rulesSnapshot, cap int64) bool {
+	return s.activeConcurrency(snap) && !s.concurrencyShadowMode(snap) && cap > 0
+}
+
+// activeQPS reports whether the QPS layer runs at all: DB override first, ini
+// second -- the precedence every other setting in this package follows.
+//
+// Every read of the master switch goes through here rather than touching
+// s.cfg.Enabled directly. A request that took its limit from the snapshot and
+// its on/off state from the ini could observe a combination that was never
+// configured, which is the same failure shadowMode exists to prevent.
+func (s *Service) activeQPS(snap *rulesSnapshot) bool {
+	if snap != nil && snap.active != nil {
+		return *snap.active
 	}
+	return s.cfg.Enabled
+}
+
+// activeConcurrency is activeQPS for the in-flight layer.
+//
+// It governs accounting, not rejection: with this on and no cap configured the
+// layer only records the per-identity in-flight distribution, which is exactly
+// the observation needed before choosing a cap. Whether an over-limit request
+// is actually refused remains a question for concurrencyShadowMode.
+func (s *Service) activeConcurrency(snap *rulesSnapshot) bool {
+	if snap != nil && snap.concurrencyActive != nil {
+		return *snap.concurrencyActive
+	}
+	return s.cfg.ConcurrencyEnabled
+}
+
+// publishRuntimeConfig mirrors resolved runtime state into gauges. Every value
+// is derived through the same helper as the request path and /stats, so a DB
+// hot-update cannot leave the dashboard showing the superseded ini baseline.
+func (s *Service) publishRuntimeConfig(snap *rulesSnapshot) {
+	boolGauge := func(g prometheus.Gauge, value bool) {
+		if value {
+			g.Set(1)
+		} else {
+			g.Set(0)
+		}
+	}
+
+	rate, burst := s.defaultParams(snap)
+	concurrency := s.concurrencyLimit(snap, "")
+	shadow := s.shadowMode(snap)
+	concurrencyShadow := s.concurrencyShadowMode(snap)
+
+	boolGauge(metricEnabled, s.activeQPS(snap))
+	boolGauge(metricShadowMode, shadow)
+	boolGauge(metricEnforcing, s.enforcing(snap))
+	metricDefaultRate.Set(float64(rate))
+	metricDefaultBurst.Set(float64(burst))
+	boolGauge(metricConcurrencyEnabled, s.activeConcurrency(snap))
+	boolGauge(metricConcurrencyShadowMode, concurrencyShadow)
+	metricDefaultConcurrency.Set(float64(concurrency))
+	boolGauge(metricConcurrencyEnforcing, s.concurrencyEnforcing(snap, concurrency))
 }
 
 // sanitizeParams converts an admin-supplied (rate, burst) pair to the int
@@ -572,12 +883,12 @@ func (s *Service) publishEnforcing(snap *rulesSnapshot) {
 // to diagnose than a crash. The upper bound also covers int64->int truncation
 // on 32-bit builds (linux/arm, linux/386), where a value above MaxInt32 would
 // wrap to a negative int.
-func sanitizeParams(rateVal, burstVal int64) (laneParams, bool) {
+func sanitizeParams(rateVal, burstVal, maxRate, maxBurst int64) (laneParams, bool) {
 	const maxInt = int64(^uint(0) >> 1) // 32-bit safe
 	if rateVal <= 0 || burstVal <= 0 {
 		return laneParams{}, false
 	}
-	if rateVal > MaxRuleRate || burstVal > MaxRuleBurst {
+	if rateVal > maxRate || burstVal > maxBurst {
 		return laneParams{}, false
 	}
 	if rateVal > maxInt || burstVal > maxInt {
@@ -604,7 +915,7 @@ func (s *Service) getUserEntry(key string, rule *Rule) *userEntry {
 	desiredRate := rate.Limit(baseRate)
 	desiredBurst := int(baseBurst)
 	if rule.Rate != nil && rule.Burst != nil {
-		if lp, ok := sanitizeParams(*rule.Rate, *rule.Burst); ok {
+		if lp, ok := sanitizeParams(*rule.Rate, *rule.Burst, s.cfg.MaxRuleRate, s.cfg.MaxRuleBurst); ok {
 			desiredRate = rate.Limit(lp.rate)
 			desiredBurst = lp.burst
 		} else {

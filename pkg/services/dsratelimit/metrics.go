@@ -42,8 +42,12 @@ var (
 		Namespace: "grafana",
 		Subsystem: "datasource_ratelimit",
 		Name:      "queries_per_request",
-		Help:      "Token cost of each /api/ds/query request, i.e. the number of backend calls it fans out to (instant/range/exemplar counted separately), not len(queries).",
-		// Buckets straddle the burst defaults (per-user 40, lane 420) so the
+		Help: "Demand cost of each /api/ds/query request before any limiter " +
+			"decision, i.e. the number of backend calls it fans out to " +
+			"(instant/range/exemplar counted separately), not len(queries). " +
+			"Includes requests projected as over-limit in shadow mode so the " +
+			"histogram can size burst without censoring the expensive tail.",
+		// Buckets straddle the identity burst baseline and the upper tail so the
 		// histogram answers the question that matters: how close are real
 		// requests to the ceiling above which they are refused permanently?
 		// Counting backend calls rather than queries raised the top end by up
@@ -87,6 +91,43 @@ var (
 			"tokens. outcome=\"allowed\" is the load that reached the backend, " +
 			"which is what a quota should be sized against.",
 	}, []string{"datasource", "outcome"})
+
+	// Runtime configuration, published without labels so a dashboard can compare
+	// observed demand against the values the request path is actually using.
+	// Admin writes override ini without a restart, so dashboard constants or the
+	// raw setting file become stale as soon as an operator tunes the limit.
+	metricEnabled = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "grafana", Subsystem: "datasource_ratelimit", Name: "enabled",
+		Help: "1 when datasource rate-limit accounting is enabled; 0 when the middleware is bypassed.",
+	})
+	metricShadowMode = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "grafana", Subsystem: "datasource_ratelimit", Name: "shadow_mode",
+		Help: "1 when QPS over-limit requests are observed but served; 0 otherwise. Read together with enabled and enforcing.",
+	})
+	metricDefaultRate = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "grafana", Subsystem: "datasource_ratelimit", Name: "default_user_rate",
+		Help: "Effective baseline per-identity token rate after DB overrides; 0 means no QPS cap.",
+	})
+	metricDefaultBurst = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "grafana", Subsystem: "datasource_ratelimit", Name: "default_user_burst",
+		Help: "Effective baseline per-identity burst after DB overrides; 0 means no QPS cap.",
+	})
+	metricConcurrencyEnabled = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "grafana", Subsystem: "datasource_ratelimit", Name: "concurrency_enabled",
+		Help: "1 when per-identity in-flight accounting is enabled; 0 when it is bypassed.",
+	})
+	metricConcurrencyShadowMode = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "grafana", Subsystem: "datasource_ratelimit", Name: "concurrency_shadow_mode",
+		Help: "1 when concurrency over-limit requests are observed but served; 0 otherwise.",
+	})
+	metricDefaultConcurrency = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "grafana", Subsystem: "datasource_ratelimit", Name: "default_user_concurrency",
+		Help: "Effective baseline per-identity in-flight limit after DB overrides; 0 means no concurrency cap.",
+	})
+	metricConcurrencyEnforcing = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "grafana", Subsystem: "datasource_ratelimit", Name: "concurrency_enforcing",
+		Help: "1 when concurrency over-limit requests are rejected; 0 when disabled, shadowed, or uncapped.",
+	})
 
 	// Config state, so a dashboard or an alert can answer "is this thing
 	// actually enforcing right now?" without shelling into a box to read the
@@ -217,6 +258,14 @@ func init() {
 		metricQueriesPerRequest,
 		metricActiveKeys,
 		metricDatasourceTokens,
+		metricEnabled,
+		metricShadowMode,
+		metricDefaultRate,
+		metricDefaultBurst,
+		metricConcurrencyEnabled,
+		metricConcurrencyShadowMode,
+		metricDefaultConcurrency,
+		metricConcurrencyEnforcing,
 		metricEnforcing,
 		metricLastReload,
 		metricOversizedBody,

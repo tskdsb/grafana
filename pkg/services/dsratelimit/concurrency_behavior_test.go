@@ -231,7 +231,6 @@ func TestConcurrency_DisabledPathsPassThrough(t *testing.T) {
 		cfg  Config
 	}{
 		{"concurrency off", func() Config { c := concCfg(1); c.ConcurrencyEnabled = false; return c }()},
-		{"service off", func() Config { c := concCfg(1); c.Enabled = false; return c }()},
 		{"limit zero means unlimited", concCfg(0)},
 		{"negative limit means unlimited", concCfg(-1)},
 	}
@@ -831,14 +830,14 @@ func TestConcurrency_StatsReportsWhatTheCapIsDoing(t *testing.T) {
 			wantRecording: true, wantEnforcing: false,
 		},
 		{
-			name: "whole service off overrides the cap's own switches",
+			name: "qps layer off leaves the cap independent",
 			mutate: func(c *Config) {
 				c.Enabled = false
 				c.ConcurrencyEnabled = true
 				c.DefaultUserConcurrency = 20
 				c.ConcurrencyShadowMode = false
 			},
-			wantRecording: false, wantEnforcing: false,
+			wantRecording: true, wantEnforcing: true,
 		},
 	}
 
@@ -848,7 +847,7 @@ func TestConcurrency_StatsReportsWhatTheCapIsDoing(t *testing.T) {
 			tc.mutate(&cfg)
 			s := newTestService(cfg)
 
-			rec := cfg.Enabled && cfg.ConcurrencyEnabled
+			rec := cfg.ConcurrencyEnabled
 			enf := rec && !cfg.ConcurrencyShadowMode && cfg.DefaultUserConcurrency > 0
 
 			if rec != tc.wantRecording {
@@ -871,4 +870,32 @@ func TestConcurrency_StatsReportsWhatTheCapIsDoing(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The in-flight layer must run with the QPS layer fully off. Its activation is
+// its own switch; gating it on QPS activation secretly coupled the two rollouts
+// and meant launching concurrency first (before QPS was enabled) silently
+// recorded nothing.
+func TestConcurrency_WorksWhenTheQPSLayerIsDisabled(t *testing.T) {
+	cfg := concCfg(1)
+	cfg.Enabled = false // QPS layer off entirely; concurrency must still enforce.
+	s := newTestService(cfg)
+
+	blocked := newBlockingHandler(3)
+	ok := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		concRequest(s, "/api/ds/query", 7, blocked.ServeHTTP)
+	}()
+	<-blocked.entered
+
+	got := concRequest(s, "/api/ds/query", 7, ok).Code
+	if got != http.StatusTooManyRequests {
+		t.Errorf("with the QPS layer disabled, concurrency still enforced: got %d, want 429", got)
+	}
+	close(blocked.release)
+	wg.Wait()
 }

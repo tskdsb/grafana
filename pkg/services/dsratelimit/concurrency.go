@@ -60,7 +60,7 @@ var managedPathRe = regexp.MustCompile(
 // The trailing slash is trimmed first for the same reason the QPS layer does it:
 // pkg/web/tree.go strips it before matching, so /api/ds/query/ reaches the same
 // handler as /api/ds/query. Treating them differently here would leave a free
-// lane open for anyone who appends a slash.
+// bypass open for anyone who appends a slash.
 func isManagedPath(p string) bool {
 	if p != "/" {
 		p = strings.TrimSuffix(p, "/")
@@ -258,7 +258,21 @@ func (s *Service) ConcurrencyMiddleware(next http.Handler) http.Handler {
 		// A nil service means the feature was never wired; a disabled one means
 		// it was wired and turned off. Both must pass traffic through
 		// untouched.
-		if s == nil || !s.cfg.Enabled || !s.cfg.ConcurrencyEnabled {
+		if s == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Both master switches come from the snapshot, so either layer can be
+		// turned on or off at runtime. Reading s.cfg here instead would have
+		// made the one operation worth doing fast -- switching a layer off
+		// when it misbehaves -- the only one needing a restart.
+		//
+		// Only the concurrency switch gates this layer; it must not also read
+		// the QPS switch. The two layers roll out independently, so turning the
+		// QPS layer off (or leaving it disabled at first launch) must not
+		// silently stop concurrency counting and rejection.
+		snapActive := s.rulesPtr.Load()
+		if !s.activeConcurrency(snapActive) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -296,14 +310,13 @@ func (s *Service) ConcurrencyMiddleware(next http.Handler) http.Handler {
 		}
 
 		snap := s.rulesPtr.Load()
-		limit := s.concurrencyLimit()
+		key := rateLimitKey(c)
+		limit := s.concurrencyLimit(snap, key)
 		// The in-flight cap's own switch, not shadowMode(snap). That one governs
 		// the QPS layer, which may already be enforcing in production; reusing
 		// it would mean a concurrency trial can only run by standing the QPS
 		// layer down.
-		shadow := s.cfg.ConcurrencyShadowMode
-
-		key := rateLimitKey(c)
+		shadow := s.concurrencyShadowMode(snap)
 
 		// Three states, not two. Disabled was handled above; what remains is
 		// observing (limit <= 0) and enforcing (limit > 0). Both count, so the
@@ -405,11 +418,34 @@ func (s *Service) ConcurrencyMiddleware(next http.Handler) http.Handler {
 
 // concurrencyLimit resolves the in-flight cap for one identity.
 //
-// Takes no identity yet: only the deploy-time default exists. Per-identity
-// overrides will arrive through the same rule table the QPS layer uses, once
-// observed data shows which identities need them; adding that plumbing now
-// would ship a schema nobody can fill in.
-func (s *Service) concurrencyLimit() int64 {
+// Three sources, most specific first: a rule for this exact identity, the
+// default rule, then the ini baseline. Same table and same precedence the QPS
+// layer uses, so an operator learns one model rather than two.
+//
+// Takes the snapshot rather than re-reading rulesPtr so that one request sees
+// one generation of config throughout -- a reload landing mid-request must not
+// produce a combination that was never configured.
+//
+// A non-positive result means no cap. That covers both "never configured" and
+// "explicitly turned off at runtime", which are the same thing as far as a
+// request is concerned: nothing was decided, so nothing is enforced.
+func (s *Service) concurrencyLimit(snap *rulesSnapshot, key string) int64 {
+	if snap != nil {
+		if r, ok := snap.byKey[key]; ok && r.Concurrency != nil {
+			if *r.Concurrency < 0 {
+				// Negative can only arrive from a direct DB edit; the admin
+				// API rejects it. Falling through to the default is the same
+				// choice reloadRules makes for a malformed rate/burst.
+				s.logger.Warn("ignoring negative concurrency override",
+					"key", key, "concurrency", *r.Concurrency)
+			} else {
+				return *r.Concurrency
+			}
+		}
+		if snap.defaultConcurrency != nil {
+			return *snap.defaultConcurrency
+		}
+	}
 	return int64(s.cfg.DefaultUserConcurrency)
 }
 

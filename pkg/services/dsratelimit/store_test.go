@@ -37,14 +37,32 @@ func TestIntegrationDsRateLimitStore(t *testing.T) {
 		require.Equal(t, int64(50), *got.Rate)
 	})
 
-	t.Run("upsert updates existing rule", func(t *testing.T) {
+	t.Run("upsert writes the row exactly as given", func(t *testing.T) {
+		// store.upsert is the plain write: whatever Rule it receives is what
+		// the row becomes, nil fields included. Merging a partial body with the
+		// stored row happens in AdminPut, which needs the old values to
+		// validate against anyway -- doing it again here would mean two places
+		// deciding what "omitted" means.
 		newRate := int64(80)
 		require.NoError(t, s.upsert(ctx, &Rule{
-			Kind: "sa", Target: "12", Mode: "limited", Rate: &newRate,
+			Kind: "sa", Target: "12", Mode: "limited", Rate: &newRate, Burst: &burst,
 		}))
 		got, err := s.get(ctx, "sa", "12")
 		require.NoError(t, err)
 		require.Equal(t, int64(80), *got.Rate)
+		require.Equal(t, int64(100), *got.Burst)
+	})
+
+	t.Run("upsert clears a field left nil", func(t *testing.T) {
+		// The behaviour AdminPut relies on to implement an explicit null.
+		other := int64(90)
+		require.NoError(t, s.upsert(ctx, &Rule{
+			Kind: "sa", Target: "12", Mode: "limited", Rate: &other,
+		}))
+		got, err := s.get(ctx, "sa", "12")
+		require.NoError(t, err)
+		require.Equal(t, int64(90), *got.Rate)
+		require.Nil(t, got.Burst, "a nil field must reach the row as NULL")
 	})
 
 	t.Run("get returns nil when not found", func(t *testing.T) {

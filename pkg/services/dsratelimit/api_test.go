@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/grafana/grafana/pkg/infra/db"
 	"github.com/grafana/grafana/pkg/infra/log"
 	contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/model"
+	"github.com/grafana/grafana/pkg/services/sqlstore"
 	"github.com/grafana/grafana/pkg/services/user"
 	"github.com/grafana/grafana/pkg/web"
 )
@@ -115,7 +117,7 @@ func TestIntegrationAdminPut_Validation(t *testing.T) {
 		{"negative burst", "sa", "21",
 			map[string]any{"mode": "limited", "rate": 30, "burst": -1}, http.StatusBadRequest},
 		{"rate above ceiling", "sa", "22",
-			map[string]any{"mode": "limited", "rate": MaxRuleRate + 1, "burst": 100}, http.StatusBadRequest},
+			map[string]any{"mode": "limited", "rate": DefaultMaxRuleRate + 1, "burst": 100}, http.StatusBadRequest},
 		{"burst below rate", "sa", "23",
 			map[string]any{"mode": "limited", "rate": 100, "burst": 50}, http.StatusBadRequest},
 	}
@@ -361,4 +363,430 @@ func TestIntegrationQuotaStats_ReportsSource(t *testing.T) {
 		"an overridden quota must be reported as coming from the DB")
 	require.Equal(t, float64(77), db["rate"],
 		"and must report the effective value, not the one it replaced")
+}
+
+// TestIntegrationAdminPut_PartialUpdate covers the three states a field can be
+// in, which is the whole of this endpoint's write semantics.
+//
+// Absent leaves the stored value alone, explicit null clears it, a value sets
+// it. The first of those is what makes the endpoint safe to use: the common
+// edit is changing one thing, and forgetting to restate the rest must not
+// silently drop it.
+//
+// This replaced whole-row replacement plus a guard that refused any write which
+// would drop a stored value. The guard worked, but it could not tell a slip
+// from a deliberate clear, so clearing one field meant DELETE then PUT, leaving
+// the identity on the deployment baseline in between. Nothing here needs that
+// detour, and there is no window.
+func TestIntegrationAdminPut_PartialUpdate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	seed := map[string]any{"mode": "limited", "rate": 10, "burst": 20, "concurrency": 5}
+
+	cases := []struct {
+		name  string
+		body  map[string]any
+		rate  any // nil means the field must be cleared
+		burst any
+		conc  any
+	}{
+		{
+			name: "omitting concurrency keeps it",
+			body: map[string]any{"mode": "limited", "rate": 30, "burst": 40},
+			rate: 30, burst: 40, conc: 5,
+		},
+		{
+			name: "omitting the QPS pair keeps it",
+			body: map[string]any{"mode": "limited", "concurrency": 8},
+			rate: 10, burst: 20, conc: 8,
+		},
+		{
+			name: "explicit null clears concurrency and keeps QPS",
+			body: map[string]any{"mode": "limited", "rate": 10, "burst": 20, "concurrency": nil},
+			rate: 10, burst: 20, conc: nil,
+		},
+		{
+			name: "explicit null clears the QPS pair and keeps concurrency",
+			body: map[string]any{"mode": "limited", "rate": nil, "burst": nil, "concurrency": 5},
+			rate: nil, burst: nil, conc: 5,
+		},
+		{
+			name: "a body with only mode changes nothing",
+			body: map[string]any{"mode": "limited"},
+			rate: 10, burst: 20, conc: 5,
+		},
+		{
+			name: "every field at once",
+			body: map[string]any{"mode": "limited", "rate": 50, "burst": 60, "concurrency": 9},
+			rate: 50, burst: 60, conc: 9,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newAdminTestService(t)
+			ctx := context.Background()
+			require.Equal(t, http.StatusOK,
+				s.AdminPut(adminPutCtx("user", "20", seed)).Status())
+
+			resp := s.AdminPut(adminPutCtx("user", "20", tc.body))
+			require.Equal(t, http.StatusOK, resp.Status())
+
+			stored, err := s.store.get(ctx, "user", "20")
+			require.NoError(t, err)
+			requireField(t, "rate", tc.rate, stored.Rate)
+			requireField(t, "burst", tc.burst, stored.Burst)
+			requireField(t, "concurrency", tc.conc, stored.Concurrency)
+		})
+	}
+}
+
+// rawInt builds the JSON body form of a set field, for tests that construct
+// UpsertBody directly rather than going through a map.
+func rawInt(v int64) json.RawMessage {
+	return json.RawMessage(strconv.FormatInt(v, 10))
+}
+
+func requireField(t *testing.T, name string, want any, got *int64) {
+	t.Helper()
+	if want == nil {
+		require.Nil(t, got, "%s should have been cleared", name)
+		return
+	}
+	require.NotNil(t, got, "%s should have been kept or set", name)
+	require.EqualValues(t, want, *got, name)
+}
+
+// TestStorePartialUpdate_RejectsInvalidMergedPair is the deterministic half of
+// the row-lock invariant. The store reads rate=10/burst=20, applies a concurrent
+// writer's stale intention to set rate=80, validates 80/20 inside the same
+// transaction, and must roll it back.
+//
+// The actual two-writer serialisation cannot be proved on SQLite: its XORM
+// dialect drops FOR UPDATE and its table-level write lock randomly surfaced a
+// 500 in 3 of 8 runs even with retries. Real MySQL concurrency is covered by
+// scripts/bytedance/boe_verify_rowlock.sh T2; the test here pins the portable
+// contract the locked writer executes once serialised.
+func TestStorePartialUpdate_RejectsInvalidMergedPair(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	s := newAdminTestService(t)
+	ctx := context.Background()
+	require.NoError(t, s.store.upsert(ctx, &Rule{
+		Kind: string(KindUser), Target: "90", Mode: string(ModeLimited),
+		Rate: ptr64(10), Burst: ptr64(20),
+	}))
+
+	written, err := s.store.upsertPartial(ctx, string(KindUser), "90", string(ModeLimited), nil,
+		fieldUpdate{present: true, value: 80}, fieldUpdate{}, fieldUpdate{},
+		func(rate, burst, conc *int64) string {
+			return validateMergedRule(KindUser, ModeLimited, rate, burst, conc, bounds{DefaultMaxRuleRate, DefaultMaxRuleBurst, DefaultMaxRuleConcurrency})
+		})
+	require.Nil(t, written)
+	var invalid *ErrInvalidMergedRule
+	require.ErrorAs(t, err, &invalid)
+	require.Contains(t, invalid.Reason, "merged result: rate=80 burst=20")
+
+	stored, getErr := s.store.get(ctx, string(KindUser), "90")
+	require.NoError(t, getErr)
+	require.EqualValues(t, 10, *stored.Rate, "the invalid transaction must roll back")
+	require.EqualValues(t, 20, *stored.Burst)
+}
+
+// TestSanitizeParams_DoesNotCheckThePair pins why the check above has to happen
+// at write time.
+//
+// sanitizeParams is the last thing between a stored rule and rate.NewLimiter,
+// and it deliberately does not verify burst >= rate -- an invalid pair is
+// applied rather than skipped. If that ever changes, the write-time check
+// becomes belt-and-braces rather than the only guard; until then it is load
+// bearing, and this test is here so nobody removes it believing otherwise.
+func TestSanitizeParams_DoesNotCheckThePair(t *testing.T) {
+	p, ok := sanitizeParams(80, 20, DefaultMaxRuleRate, DefaultMaxRuleBurst)
+	require.True(t, ok,
+		"sanitizeParams accepts burst < rate; the pairing check must happen before storage")
+	require.Equal(t, 80, p.rate)
+	require.Equal(t, 20, p.burst)
+}
+
+// TestIntegrationAdminPut_ValidatesTheMergedRule checks that validation judges
+// the rule as it will be stored, not the body in isolation.
+//
+// This is where partial update could go wrong: "rate=30" alone is fine when a
+// burst is already stored and invalid when it is not, and only the merged view
+// can tell the difference. Validating the body alone would accept the second
+// case and store a rule reloadRules silently skips -- an operator would see
+// 200 and no limit.
+func TestIntegrationAdminPut_ValidatesTheMergedRule(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	cases := []struct {
+		name       string
+		seed       map[string]any
+		body       map[string]any
+		wantStatus int
+		wantMsg    string
+	}{
+		{
+			name:       "rate alone is accepted when a burst is stored",
+			seed:       map[string]any{"mode": "limited", "rate": 10, "burst": 100},
+			body:       map[string]any{"mode": "limited", "rate": 30},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "rate alone is refused when no burst is stored",
+			seed:       map[string]any{"mode": "limited", "concurrency": 5},
+			body:       map[string]any{"mode": "limited", "rate": 30},
+			wantStatus: http.StatusBadRequest,
+			wantMsg:    "rate and burst must both be set",
+		},
+		{
+			name:       "burst below the stored rate is refused",
+			seed:       map[string]any{"mode": "limited", "rate": 100, "burst": 200},
+			body:       map[string]any{"mode": "limited", "burst": 50},
+			wantStatus: http.StatusBadRequest,
+			wantMsg:    "burst must be", // JSON escapes ">=" as \u003e=
+		},
+		{
+			name:       "clearing every field is refused",
+			seed:       map[string]any{"mode": "limited", "rate": 10, "burst": 20, "concurrency": 5},
+			body:       map[string]any{"mode": "limited", "rate": nil, "burst": nil, "concurrency": nil},
+			wantStatus: http.StatusBadRequest,
+			wantMsg:    "needs rate and burst, a concurrency cap, or both",
+		},
+		{
+			name:       "a non-integer value is refused rather than ignored",
+			seed:       map[string]any{"mode": "limited", "rate": 10, "burst": 20},
+			body:       map[string]any{"mode": "limited", "rate": "thirty"},
+			wantStatus: http.StatusBadRequest,
+			wantMsg:    "rate must be an integer or null",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newAdminTestService(t)
+			require.Equal(t, http.StatusOK,
+				s.AdminPut(adminPutCtx("user", "21", tc.seed)).Status())
+
+			resp := s.AdminPut(adminPutCtx("user", "21", tc.body))
+			require.Equal(t, tc.wantStatus, resp.Status())
+			if tc.wantMsg != "" {
+				require.Contains(t, string(resp.Body()), tc.wantMsg)
+			}
+		})
+	}
+}
+
+// deleteReadFailureDB fails only the pre-delete read; writes would still work.
+// A fully broken DB would mask the bug because DELETE would also fail.
+type deleteReadFailureDB struct {
+	db.DB
+	writes int
+}
+
+func (d *deleteReadFailureDB) WithDbSession(context.Context, sqlstore.DBTransactionFunc) error {
+	return context.DeadlineExceeded
+}
+
+func (d *deleteReadFailureDB) WithTransactionalDbSession(ctx context.Context, fn sqlstore.DBTransactionFunc) error {
+	d.writes++
+	return d.DB.WithTransactionalDbSession(ctx, fn)
+}
+
+func TestIntegrationAdminDelete_ReadFailurePreservesRule(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	s := newAdminTestService(t)
+	ctx := context.Background()
+	require.Equal(t, http.StatusOK, s.AdminPut(adminPutCtx("user", "22",
+		map[string]any{"mode": "limited", "rate": 10, "burst": 20, "concurrency": 5})).Status())
+	before, err := s.store.get(ctx, "user", "22")
+	require.NoError(t, err)
+	snap := s.rulesPtr.Load()
+	originalDB := s.store.db
+	failing := &deleteReadFailureDB{DB: originalDB}
+	s.store.db = failing
+	defer func() { s.store.db = originalDB }()
+
+	delCtx := adminPutCtx("user", "22", nil)
+	delCtx.Req.Method = http.MethodDelete
+	resp := s.AdminDelete(delCtx)
+	s.store.db = originalDB
+	after, err := s.store.get(ctx, "user", "22")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusInternalServerError, resp.Status())
+	require.Contains(t, string(resp.Body()), "failed to read the existing rule")
+	require.Zero(t, failing.writes, "a failed audit read must stop before DELETE")
+	require.Equal(t, before, after, "the stored rule must survive the failed request")
+	require.Same(t, snap, s.rulesPtr.Load(), "the effective rule must not change")
+}
+
+// TestIntegrationAdminDelete_ReloadsWithoutTheRule pins that removing a rule
+// takes effect immediately rather than at the next 30s reload.
+//
+// DELETE now means only one thing -- drop every override for this identity --
+// and it is a single request, so there is no window. Clearing one field while
+// keeping the rest is a PUT with that field null; DELETE is no longer part of
+// editing a rule, which is what previously left an identity on the deployment
+// baseline between the delete and the write.
+func TestIntegrationAdminDelete_ReloadsWithoutTheRule(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	s := newAdminTestService(t)
+	ctx := context.Background()
+
+	require.Equal(t, http.StatusOK, s.AdminPut(adminPutCtx("user", "22",
+		map[string]any{"mode": "limited", "rate": 10, "burst": 20, "concurrency": 5})).Status())
+	require.EqualValues(t, 5, s.concurrencyLimit(s.rulesPtr.Load(), "user:22"),
+		"the cap should be live after the write")
+
+	req := httptest.NewRequest(http.MethodDelete,
+		"/api/admin/datasource-rate-limits/user/22", nil)
+	req = web.SetURLParams(req, map[string]string{":kind": "user", ":target": "22"})
+	rec := httptest.NewRecorder()
+	delCtx := &contextmodel.ReqContext{
+		SignedInUser: &user.SignedInUser{UserID: 1, Login: "admin"},
+		Context:      &web.Context{Req: req, Resp: web.NewResponseWriter(req.Method, rec)},
+	}
+	require.Equal(t, http.StatusOK, s.AdminDelete(delCtx).Status())
+
+	// Both layers are back to the deployment baseline, immediately. Asserted
+	// rather than glossed over: an operator clearing one value should know the
+	// other goes with it until the rule is rewritten.
+	require.EqualValues(t, s.cfg.DefaultUserConcurrency,
+		s.concurrencyLimit(s.rulesPtr.Load(), "user:22"),
+		"the cap must fall back the moment the rule is deleted")
+	_, err := s.store.get(ctx, "user", "22")
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusOK, s.AdminPut(adminPutCtx("user", "22",
+		map[string]any{"mode": "limited", "concurrency": 7})).Status())
+	stored, err := s.store.get(ctx, "user", "22")
+	require.NoError(t, err)
+	require.Nil(t, stored.Rate, "the QPS override was meant to go")
+	require.EqualValues(t, 7, *stored.Concurrency)
+}
+
+// TestAdminPut_SwitchKindsRequireTheDefaultTarget covers a reviewer-found gap.
+//
+// The four deployment-wide switches are resolved by reloadRules on r.Kind
+// alone; r.Target is never read. So a row written under a mistyped target is
+// not the harmless no-op that a mistyped kind=default row would be -- it takes
+// effect deployment-wide. Two rows of one kind disagreeing then resolve by
+// whichever store.list returns last, and list does no ordering, so the switch
+// would follow row order rather than intent.
+//
+// Found because mode=unlimited needs no rate/burst: the "needs rate and burst"
+// check happens to mask this for mode=limited, which made the gap look absent
+// until a rule that skips that check was tried.
+func TestIntegrationAdminPut_SwitchKindsRequireTheDefaultTarget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	for _, kind := range []string{
+		"activation", "concurrency_activation", "enforcement", "concurrency_enforcement",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			s := newAdminTestService(t)
+
+			// mode=unlimited carries no rate/burst, so it reaches the target
+			// check instead of being turned away by the pairing rule first.
+			resp := s.AdminPut(adminPutCtx(kind, "typo", map[string]any{"mode": "unlimited"}))
+			require.Equal(t, http.StatusBadRequest, resp.Status(),
+				"a non-default target must be refused: reloadRules ignores Target, "+
+					"so this row would act as a second deployment-wide switch")
+
+			// Nothing may have been stored, or a later reload would apply it.
+			stored, err := s.store.get(context.Background(), kind, "typo")
+			require.NoError(t, err)
+			require.Nil(t, stored, "a refused switch row must not reach the table")
+
+			// The documented target still works.
+			require.Equal(t, http.StatusOK,
+				s.AdminPut(adminPutCtx(kind, DefaultTarget,
+					map[string]any{"mode": "unlimited"})).Status())
+		})
+	}
+}
+
+// TestIntegrationAdminPut_SwitchKindsTakeModeAlone covers a gap that only a
+// real PUT found.
+//
+// A switch kind's entire payload is its mode -- there is no rate, burst or
+// concurrency to send. The "mode=limited needs rate and burst" rule exempted
+// the two enforcement kinds by name, so when the activation kinds were added
+// they fell under it: PUT /activation/default {"mode":"limited"} returned 400
+// and there was no way to turn the layer back on through the API. Turning it
+// off worked, because mode=unlimited skips that rule -- so the switch was
+// one-way.
+//
+// The exemption is now a predicate shared with validateTarget, rather than a
+// list repeated at each site, since the list has grown twice and a site was
+// missed both times.
+func TestIntegrationAdminPut_SwitchKindsTakeModeAlone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	for _, kind := range []string{
+		"activation", "concurrency_activation", "enforcement", "concurrency_enforcement",
+	} {
+		for _, mode := range []string{"limited", "unlimited"} {
+			t.Run(kind+"/"+mode, func(t *testing.T) {
+				s := newAdminTestService(t)
+				require.Equal(t, http.StatusOK,
+					s.AdminPut(adminPutCtx(kind, DefaultTarget,
+						map[string]any{"mode": mode})).Status(),
+					"a switch carries only a mode; both directions must be writable "+
+						"or the switch is one-way")
+			})
+		}
+		t.Run(kind+"/rejects-blocked", func(t *testing.T) {
+			s := newAdminTestService(t)
+			ctx := context.Background()
+			for _, existing := range []bool{false, true} {
+				if existing {
+					require.Equal(t, http.StatusOK, s.AdminPut(adminPutCtx(kind, DefaultTarget,
+						map[string]any{"mode": "limited"})).Status())
+				}
+				before, err := s.store.get(ctx, kind, DefaultTarget)
+				require.NoError(t, err)
+				snap := s.rulesPtr.Load()
+				resp := s.AdminPut(adminPutCtx(kind, DefaultTarget, map[string]any{"mode": "blocked"}))
+				require.Equal(t, http.StatusBadRequest, resp.Status(), "existing=%v", existing)
+				after, err := s.store.get(ctx, kind, DefaultTarget)
+				require.NoError(t, err)
+				require.Equal(t, before, after, "rejection must not create or overwrite a switch")
+				require.Same(t, snap, s.rulesPtr.Load(), "rejection must leave runtime state unchanged")
+			}
+		})
+	}
+	// The inverse: a switch kind must not accept numbers either. The two
+	// activation kinds used to store rate/burst/concurrency that reloadRules
+	// ignores, so the PUT returned 200 while no limit changed.
+	for _, kind := range []string{
+		"activation", "concurrency_activation", "enforcement", "concurrency_enforcement",
+	} {
+		for _, body := range []map[string]any{
+			{"mode": "limited", "rate": 20},
+			{"mode": "limited", "burst": 40},
+			{"mode": "limited", "concurrency": 4},
+		} {
+			t.Run(kind+"/rejects-numbers", func(t *testing.T) {
+				s := newAdminTestService(t)
+				require.Equal(t, http.StatusBadRequest, s.AdminPut(adminPutCtx(kind, DefaultTarget, body)).Status(),
+					"a switch takes mode only; persisting ignored numbers would falsely report success")
+				got, err := s.store.get(context.Background(), kind, DefaultTarget)
+				require.NoError(t, err)
+				require.Nil(t, got, "a rejected switch PUT must not leave a row behind")
+			})
+		}
+	}
 }

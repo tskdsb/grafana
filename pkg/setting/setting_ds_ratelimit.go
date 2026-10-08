@@ -27,6 +27,21 @@ type DsRateLimitSettings struct {
 	// independently once QPS is enforcing.
 	ConcurrencyShadowMode bool
 
+	// MaxRule* are the ceilings the admin API validates a submitted rule
+	// against. They are guard rails against a typo -- an extra digit, or a
+	// value that overflows int on a 32-bit build -- not operational settings;
+	// use mode=unlimited to express "no limit".
+	//
+	// Configurable rather than compile-time because the right ceiling depends
+	// on the deployment, and rebuilding an image to adjust a bound nobody
+	// should be approaching is a poor trade. Deliberately NOT hot-reloadable:
+	// a ceiling is a safety property, and one that can be raised at runtime by
+	// the same API call it is meant to constrain is not a constraint. Changing
+	// it is a deploy-time decision, which the restart makes explicit.
+	MaxRuleRate        int
+	MaxRuleBurst       int
+	MaxRuleConcurrency int
+
 	// Quotas holds the deploy-time per-datasource quotas declared as
 	// [datasource_ratelimit.quota.<uid>] sections, keyed by datasource UID.
 	//
@@ -58,8 +73,13 @@ func (cfg *Cfg) readDsRateLimitSettings() {
 	// own. Keep in sync with conf/defaults.ini -- this fallback applies when
 	// the key is absent entirely.
 	cfg.DsRateLimit.ShadowMode = s.Key("shadow_mode").MustBool(true)
-	cfg.DsRateLimit.DefaultUserRate = s.Key("default_user_rate").MustInt(20)
-	cfg.DsRateLimit.DefaultUserBurst = s.Key("default_user_burst").MustInt(40)
+	// Fallback 0, not the shipped 20/40: an absent key means nobody has chosen
+	// a limit, and inventing one here would enforce a number the deployment
+	// never asked for. conf/defaults.ini still ships 20/40, so a normal install
+	// gets them; this path is for a config that omits the key entirely.
+	// dsratelimit reads 0 as "do not limit".
+	cfg.DsRateLimit.DefaultUserRate = s.Key("default_user_rate").MustInt(0)
+	cfg.DsRateLimit.DefaultUserBurst = s.Key("default_user_burst").MustInt(0)
 	cfg.DsRateLimit.CacheMaxEntries = s.Key("cache_max_entries").MustInt(10000)
 	cfg.DsRateLimit.ConcurrencyEnabled = s.Key("concurrency_enabled").MustBool(false)
 	// 0 = unlimited, which is the deploy default: the number can only come
@@ -68,6 +88,17 @@ func (cfg *Cfg) readDsRateLimitSettings() {
 	// Shadow by default, like the QPS layer: a new enforcement path must not
 	// start rejecting on its own.
 	cfg.DsRateLimit.ConcurrencyShadowMode = s.Key("concurrency_shadow_mode").MustBool(true)
+	// Ceilings. The fallbacks match conf/defaults.ini and are sized so that a
+	// legitimate value never meets them: the highest per-identity rate anyone
+	// has had cause to set is two orders of magnitude below 1000, and an
+	// in-flight cap is a single- or double-digit number in practice.
+	//
+	// A non-positive or absent value falls back rather than disabling the
+	// check: a ceiling that can be switched off by omission is not a guard
+	// rail. dsratelimit re-validates and logs if a configured bound is unusable.
+	cfg.DsRateLimit.MaxRuleRate = s.Key("max_rule_rate").MustInt(1000)
+	cfg.DsRateLimit.MaxRuleBurst = s.Key("max_rule_burst").MustInt(1000)
+	cfg.DsRateLimit.MaxRuleConcurrency = s.Key("max_rule_concurrency").MustInt(100)
 	cfg.DsRateLimit.Quotas = extractDsRateLimitQuotas(cfg.Raw.Sections())
 }
 

@@ -41,4 +41,16 @@ type Config struct {
 	// same time -- dropping the protection that is already load-bearing in
 	// order to trial one that is not.
 	ConcurrencyShadowMode bool
+
+	// MaxRuleRate / MaxRuleBurst / MaxRuleConcurrency are the ceilings the
+	// admin API validates against, resolved from the ini with the Default*
+	// constants as fallback.
+	//
+	// Held in Config rather than as package constants so a deployment can move
+	// them without a rebuild, and read from here rather than from a snapshot
+	// so they cannot be raised at runtime: a ceiling that the API it guards can
+	// lift is not a guard. Changing one is a deploy-time act.
+	MaxRuleRate        int64
+	MaxRuleBurst       int64
+	MaxRuleConcurrency int64
 }

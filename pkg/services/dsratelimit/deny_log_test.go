@@ -56,7 +56,7 @@ func withCapturingLogger(s *Service) *capturingLogger {
 }
 
 // TestDenyLogging_IdentifiesTheCaller is the point of the deny log: metrics
-// carry only {lane, kind, reason} (no per-identity label, on purpose, to keep
+// carry only {datasource, kind, reason} (no per-identity label, on purpose, to keep
 // cardinality bounded), so the log is the only place the operator can learn
 // *which* caller is being throttled.
 func TestDenyLogging_IdentifiesTheCaller(t *testing.T) {

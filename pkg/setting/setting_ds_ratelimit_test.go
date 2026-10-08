@@ -10,19 +10,21 @@ import (
 	"gopkg.in/ini.v1"
 )
 
-// TestDsRateLimitDefaults_MatchDefaultsIni locks the two copies of every
-// default against each other.
+// TestDsRateLimitDefaults_MatchDefaultsIni checks the shipped defaults, and
+// that an absent key limits nothing.
 //
-// There are deliberately two: conf/defaults.ini is what ships and what an
-// operator reads, while the MustXxx fallbacks in readDsRateLimitSettings apply
-// when a key is absent entirely (a trimmed custom.ini, an older packaged
-// defaults.ini, or a unit test building Cfg from an empty ini). If the two
-// drift, the effective limit depends on which file the deployment happens to
-// have — the worst possible failure mode for a limiter, because it is silent
-// and only shows up as unexplained 429s or as no protection at all.
+// The two sources are no longer mirror images, and deliberately so. Before,
+// the MustXxx fallbacks duplicated conf/defaults.ini so that a trimmed
+// custom.ini produced the same limit as a full install. That made the
+// effective limit depend on which file the deployment happened to have, and
+// worse, it meant a deployment that never mentioned rate limiting still got
+// one -- at numbers measured on somebody else's traffic.
 //
-// The values themselves are derived in the defaults.ini comment block from
-// measured traffic; this test only asserts the two sources agree.
+// The fallbacks are now zero, which dsratelimit reads as "do not limit". A
+// deployment that states a limit gets it; one that does not, is not limited
+// by a number nobody chose. conf/defaults.ini still ships real values, so a
+// normal install is protected, and this test keeps asserting that those
+// shipped values are internally consistent.
 func TestDsRateLimitDefaults_MatchDefaultsIni(t *testing.T) {
 	iniPath := findDefaultsIni(t)
 
@@ -34,22 +36,26 @@ func TestDsRateLimitDefaults_MatchDefaultsIni(t *testing.T) {
 	cfg := NewCfg()
 	cfg.readDsRateLimitSettings()
 
-	for _, tc := range []struct {
-		key  string
-		got  int
-		what string
-	}{
-		{"default_user_rate", cfg.DsRateLimit.DefaultUserRate, "per-user rate"},
-		{"default_user_burst", cfg.DsRateLimit.DefaultUserBurst, "per-user burst"},
-	} {
-		t.Run(tc.key, func(t *testing.T) {
-			want, ok := section[tc.key]
-			require.True(t, ok, "%s missing from [datasource_ratelimit] in %s", tc.key, iniPath)
+	// With no section at all, nothing may be limited.
+	require.Zero(t, cfg.DsRateLimit.DefaultUserRate,
+		"an absent default_user_rate must not fall back to a limit")
+	require.Zero(t, cfg.DsRateLimit.DefaultUserBurst,
+		"an absent default_user_burst must not fall back to a limit")
+	require.Zero(t, cfg.DsRateLimit.DefaultUserConcurrency,
+		"an absent default_user_concurrency must not fall back to a cap")
+
+	// The shipped values are what a normal install runs on, so they still have
+	// to be present and usable. Parsed straight from the file rather than
+	// through Cfg, which is the point: this is about what we ship.
+	shipped := map[string]int{}
+	for _, key := range []string{"default_user_rate", "default_user_burst"} {
+		t.Run(key, func(t *testing.T) {
+			want, ok := section[key]
+			require.True(t, ok, "%s missing from [datasource_ratelimit] in %s", key, iniPath)
 			n, err := strconv.Atoi(want)
-			require.NoError(t, err, "%s = %q is not an integer", tc.key, want)
-			require.Equal(t, n, tc.got,
-				"%s (%s) disagrees: defaults.ini says %d, readDsRateLimitSettings falls back to %d",
-				tc.key, tc.what, n, tc.got)
+			require.NoError(t, err, "%s = %q is not an integer", key, want)
+			require.Positive(t, n, "%s must ship a usable value", key)
+			shipped[key] = n
 		})
 	}
 
@@ -62,7 +68,7 @@ func TestDsRateLimitDefaults_MatchDefaultsIni(t *testing.T) {
 
 	// Burst must be >= rate, or the very first request of a quiet period is
 	// denied (x/time/rate starts full but cannot exceed burst).
-	require.GreaterOrEqual(t, cfg.DsRateLimit.DefaultUserBurst, cfg.DsRateLimit.DefaultUserRate,
+	require.GreaterOrEqual(t, shipped["default_user_burst"], shipped["default_user_rate"],
 		"per-user burst must be >= rate")
 
 	// The same invariant for datasource quotas is enforced at the write path
@@ -83,10 +89,10 @@ func TestDsRateLimitDefaults_MatchDefaultsIni(t *testing.T) {
 	// the five largest dashboards on this deployment, the worst single panel
 	// costs 29 tokens. Raise this only alongside a fresh measurement.
 	const maxObservedRequestCost = 29
-	require.GreaterOrEqual(t, cfg.DsRateLimit.DefaultUserBurst, maxObservedRequestCost,
+	require.GreaterOrEqual(t, shipped["default_user_burst"], maxObservedRequestCost,
 		"per-user burst (%d) must be >= the largest observed single-request cost (%d), "+
 			"otherwise x/time/rate denies those requests forever (rate.go:371)",
-		cfg.DsRateLimit.DefaultUserBurst, maxObservedRequestCost)
+		shipped["default_user_burst"], maxObservedRequestCost)
 	// The equivalent floor for datasource quotas cannot be asserted here:
 	// quotas live in the datasource_rate_limit table, not in this file. It is
 	// enforced at the write path instead (AdminPut requires burst >= rate) and

@@ -23,6 +23,57 @@ func counterValue(t *testing.T, vec *prometheus.CounterVec, labels ...string) fl
 	return pb.GetCounter().GetValue()
 }
 
+func histogramValue(t *testing.T, observer prometheus.Observer) (count uint64, sum float64) {
+	t.Helper()
+	var pb dto.Metric
+	require.NoError(t, observer.(prometheus.Metric).Write(&pb))
+	h := pb.GetHistogram()
+	return h.GetSampleCount(), h.GetSampleSum()
+}
+
+func freshQueriesPerRequest(t *testing.T) {
+	t.Helper()
+	saved := metricQueriesPerRequest
+	metricQueriesPerRequest = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "test_queries_per_request",
+		Buckets: []float64{1, 2, 5, 10, 20, 40, 100, 300, 1000},
+	})
+	t.Cleanup(func() { metricQueriesPerRequest = saved })
+}
+
+// TestQueriesPerRequest_RecordsDemandBeforeTheLimiterDecides pins the metric's
+// sizing semantics: it measures requested cost, not the subset the current
+// rate/burst happened to admit.
+//
+// This distinction is load-bearing during shadow rollout. An over-burst
+// request is still served in shadow mode, and is exactly the observation an
+// operator needs before raising burst. Recording only outcomeAllowed made the
+// histogram self-censor at the configured limit: the expensive request used to
+// size burst was missing because the old burst was already too small.
+func TestQueriesPerRequest_RecordsDemandBeforeTheLimiterDecides(t *testing.T) {
+	freshQueriesPerRequest(t)
+	cfg := defaultCfg()
+	cfg.Enabled, cfg.ShadowMode = true, true
+	cfg.DefaultUserRate, cfg.DefaultUserBurst = 1, 1
+	s := newTestService(cfg)
+
+	// Three backend calls in one HTTP request, above burst=1. Shadow mode must
+	// serve it, and the histogram must still contain the cost of three.
+	body := []byte(`{"queries":[
+		{"range":true,"datasource":{"uid":"PROM_MAIN"}},
+		{"instant":true,"datasource":{"uid":"PROM_MAIN"}},
+		{"datasource":{"uid":"PROM_MAIN"}}
+	]}`)
+	c, rec := buildCtx("POST", dsQueryPath, body, &user.SignedInUser{UserID: 5})
+	s.Middleware(c)
+
+	require.Equal(t, http.StatusOK, rec.Code, "shadow mode must serve the over-burst request")
+	count, sum := histogramValue(t, metricQueriesPerRequest)
+	require.EqualValues(t, 1, count, "every /api/ds/query demand must be sampled exactly once")
+	require.Equal(t, float64(3), sum,
+		"burst sizing must see the full cost even when the current limiter says it is too expensive")
+}
+
 // TestDeniedMetric_DistinguishesShadowFromEnforced is the reason the `enforced`
 // label exists.
 //
@@ -73,6 +124,42 @@ func TestDeniedMetric_DistinguishesShadowFromEnforced(t *testing.T) {
 			"of requests actually refused")
 	require.Zero(t, shadowCount,
 		"nothing may be attributed to shadow mode while enforcing")
+}
+
+func gaugeValue(t *testing.T, gauge prometheus.Gauge) float64 {
+	t.Helper()
+	var pb dto.Metric
+	require.NoError(t, gauge.Write(&pb))
+	return pb.GetGauge().GetValue()
+}
+
+// TestRuntimeConfigMetrics_ReportEffectiveHotReloadedState makes the dashboard
+// independent of stale ini knowledge. The DB can hot-change every value below;
+// publishing cfg fields alone would make the graph disagree with the request
+// path immediately after an admin update.
+func TestRuntimeConfigMetrics_ReportEffectiveHotReloadedState(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.Enabled, cfg.ShadowMode = true, true
+	cfg.DefaultUserRate, cfg.DefaultUserBurst = 20, 40
+	cfg.ConcurrencyEnabled, cfg.ConcurrencyShadowMode = true, true
+	cfg.DefaultUserConcurrency = 0
+	s := newTestService(cfg,
+		&Rule{Kind: string(KindDefault), Target: DefaultTarget, Mode: string(ModeLimited),
+			Rate: ptr64(55), Burst: ptr64(80), Concurrency: ptr64(12)},
+		enforcementRule(true),
+		&Rule{Kind: string(KindConcurrencyEnforcement), Target: DefaultTarget, Mode: string(ModeLimited)},
+	)
+
+	s.publishRuntimeConfig(s.rulesPtr.Load())
+	require.Equal(t, float64(1), gaugeValue(t, metricEnabled))
+	require.Equal(t, float64(0), gaugeValue(t, metricShadowMode))
+	require.Equal(t, float64(1), gaugeValue(t, metricEnforcing))
+	require.Equal(t, float64(55), gaugeValue(t, metricDefaultRate))
+	require.Equal(t, float64(80), gaugeValue(t, metricDefaultBurst))
+	require.Equal(t, float64(1), gaugeValue(t, metricConcurrencyEnabled))
+	require.Equal(t, float64(0), gaugeValue(t, metricConcurrencyShadowMode))
+	require.Equal(t, float64(12), gaugeValue(t, metricDefaultConcurrency))
+	require.Equal(t, float64(1), gaugeValue(t, metricConcurrencyEnforcing))
 }
 
 // TestEnforcingGauge_ReportsConfiguredState pins the "is it actually on?" signal.
@@ -264,4 +351,66 @@ func TestDenyAttribution_SaturatedDatasourceDoesNotBlameCaller(t *testing.T) {
 	require.InDelta(t, float64(entry.limiter.Burst()-1),
 		entry.limiter.TokensAt(time.Now()), 0.5,
 		"exactly one token spent -- the request that was served")
+}
+
+// TestMasterSwitches_AreHotReloadable is the "no knob needs a restart" claim,
+// asserted rather than assumed.
+//
+// The two master switches were the last settings still read straight from the
+// ini. That made the one move an operator wants fastest -- switching a layer
+// off when it is causing harm -- the only one costing a restart, which on a
+// shared Grafana means a minute of everyone's dashboards failing.
+func TestMasterSwitches_AreHotReloadable(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.Enabled, cfg.ConcurrencyEnabled = false, false
+
+	// Nothing stored: the ini still decides, so an absent row cannot arm a
+	// layer by omission.
+	s := newTestService(cfg)
+	require.False(t, s.activeQPS(s.rulesPtr.Load()))
+	require.False(t, s.activeConcurrency(s.rulesPtr.Load()))
+
+	// Stored rows flip both on, with the ini still saying false.
+	on := newTestService(cfg,
+		&Rule{Kind: string(KindActivation), Target: DefaultTarget, Mode: string(ModeLimited)},
+		&Rule{Kind: string(KindConcurrencyActivation), Target: DefaultTarget, Mode: string(ModeLimited)},
+	)
+	require.True(t, on.activeQPS(on.rulesPtr.Load()),
+		"a stored activation row must override the ini without a restart")
+	require.True(t, on.activeConcurrency(on.rulesPtr.Load()))
+
+	// And the reverse: ini true, row turns it off. This is the rollback path,
+	// so it matters more than the one above.
+	cfgOn := defaultCfg()
+	cfgOn.Enabled, cfgOn.ConcurrencyEnabled = true, true
+	off := newTestService(cfgOn,
+		&Rule{Kind: string(KindActivation), Target: DefaultTarget, Mode: string(ModeUnlimited)},
+		&Rule{Kind: string(KindConcurrencyActivation), Target: DefaultTarget, Mode: string(ModeUnlimited)},
+	)
+	require.False(t, off.activeQPS(off.rulesPtr.Load()),
+		"turning the layer off at runtime is the rollback path and must not need a restart")
+	require.False(t, off.activeConcurrency(off.rulesPtr.Load()))
+
+	// The two layers are independent: switching one must not move the other.
+	mixed := newTestService(cfgOn,
+		&Rule{Kind: string(KindConcurrencyActivation), Target: DefaultTarget, Mode: string(ModeUnlimited)},
+	)
+	require.True(t, mixed.activeQPS(mixed.rulesPtr.Load()),
+		"turning concurrency off must leave the QPS layer alone")
+	require.False(t, mixed.activeConcurrency(mixed.rulesPtr.Load()))
+}
+
+// TestActivationGauge_FollowsTheRuntimeValue stops the dashboard disagreeing
+// with the request path: both must read the same resolved switch.
+func TestActivationGauge_FollowsTheRuntimeValue(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.Enabled, cfg.ConcurrencyEnabled = false, false
+	s := newTestService(cfg,
+		&Rule{Kind: string(KindActivation), Target: DefaultTarget, Mode: string(ModeLimited)},
+		&Rule{Kind: string(KindConcurrencyActivation), Target: DefaultTarget, Mode: string(ModeLimited)},
+	)
+	s.publishRuntimeConfig(s.rulesPtr.Load())
+	require.Equal(t, float64(1), gaugeValue(t, metricEnabled),
+		"the gauge must report the value the request path uses, not the ini")
+	require.Equal(t, float64(1), gaugeValue(t, metricConcurrencyEnabled))
 }

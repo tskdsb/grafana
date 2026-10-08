@@ -37,7 +37,7 @@ func newTestService(cfg Config, rules ...*Rule) *Service {
 		// Datasource rules become quotas, mirroring reloadRules, so tests
 		// exercise the same resolution path production does.
 		if r.Kind == string(KindDatasource) && r.Rate != nil && r.Burst != nil {
-			if lp, ok := sanitizeParams(*r.Rate, *r.Burst); ok {
+			if lp, ok := sanitizeParams(*r.Rate, *r.Burst, DefaultMaxRuleRate, DefaultMaxRuleBurst); ok {
 				snap.dsQuota[r.Target] = lp
 				continue
 			}
@@ -45,11 +45,51 @@ func newTestService(cfg Config, rules ...*Rule) *Service {
 		// Same for the deployment-wide default: reloadRules puts it in
 		// snap.defaults, not in byKey, and resolveRule only ever reads it from
 		// there.
-		if r.Kind == string(KindDefault) && r.Rate != nil && r.Burst != nil {
-			if lp, ok := sanitizeParams(*r.Rate, *r.Burst); ok {
-				snap.defaults = &lp
+		if r.Kind == string(KindDefault) {
+			// Mirrors reloadRules: the QPS pair and the in-flight cap are
+			// applied independently, so a default row carrying only one of
+			// them still takes effect.
+			if r.Concurrency != nil && *r.Concurrency >= 0 {
+				v := *r.Concurrency
+				snap.defaultConcurrency = &v
+			}
+			if r.Rate != nil && r.Burst != nil {
+				if lp, ok := sanitizeParams(*r.Rate, *r.Burst, DefaultMaxRuleRate, DefaultMaxRuleBurst); ok {
+					snap.defaults = &lp
+				}
+			}
+			continue
+		}
+		// Mirrors reloadRules: each layer's master switch is hot-reloadable.
+		if r.Kind == string(KindActivation) || r.Kind == string(KindConcurrencyActivation) {
+			var v bool
+			switch Mode(r.Mode) {
+			case ModeLimited:
+				v = true
+			case ModeUnlimited:
+				v = false
+			default:
 				continue
 			}
+			if r.Kind == string(KindActivation) {
+				snap.active = &v
+			} else {
+				snap.concurrencyActive = &v
+			}
+			continue
+		}
+		// Mirrors reloadRules: each layer has its own enforcement switch.
+		if r.Kind == string(KindConcurrencyEnforcement) {
+			switch Mode(r.Mode) {
+			case ModeLimited:
+				v := false
+				snap.concurrencyShadow = &v
+			case ModeUnlimited:
+				v := true
+				snap.concurrencyShadow = &v
+			default:
+			}
+			continue
 		}
 		// Enforcement carries its decision in Mode, mirroring reloadRules.
 		if r.Kind == string(KindEnforcement) {
@@ -85,6 +125,13 @@ func defaultCfg() Config {
 		Enabled:          true,
 		DefaultUserRate:  30,
 		DefaultUserBurst: 100,
+		// The ceilings the admin API validates against. Set here because
+		// production resolves them in ProvideService, which tests bypass; a
+		// zero bound would reject every rule and the failure would look like a
+		// validation bug rather than an unset test fixture.
+		MaxRuleRate:        DefaultMaxRuleRate,
+		MaxRuleBurst:       DefaultMaxRuleBurst,
+		MaxRuleConcurrency: DefaultMaxRuleConcurrency,
 	}
 }
 

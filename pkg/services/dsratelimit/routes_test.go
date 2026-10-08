@@ -155,7 +155,7 @@ func findAPIGoPath(t *testing.T) string {
 // (asserted below, so this is not an assumption). An exact string compare in
 // isDsQueryRoute therefore let a caller charge an N-query request as a single
 // token just by appending a slash — defeating the per-query accounting that
-// makes lane_default_rate correspond to backend QPS.
+// makes a datasource quota correspond to backend QPS.
 //
 // The pairing matters: the accounting predicate must agree with what macaron
 // actually routes. Charging per-query on a path that never reaches the handler
@@ -218,10 +218,10 @@ func TestIsDsQueryRoute_TrailingSlash(t *testing.T) {
 // The Prometheus datasource runs instant / range / exemplar as three
 // independent ifs (pkg/tsdb/prometheus/querydata/request.go:125,131,143), so
 // one query can issue up to three backend calls. If the limiter charged
-// len(queries) instead, lane_default_rate would admit ~1.2-1.5x the backend
+// len(queries) instead, a datasource quota would admit ~1.2-1.5x the backend
 // QPS it names, and the operator would have to maintain an empirical
 // correction factor that drifts with traffic mix. Counting the flags keeps
-// the lane limit derivable from the backend quota by plain subtraction.
+// each datasource limit derivable from the backend quota by plain subtraction.
 //
 // The legacy fallback case is the dangerous one: older dashboards send
 // neither `range` nor `instant`, and models/query.go:103-105 treats that as a

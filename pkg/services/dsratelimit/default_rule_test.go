@@ -84,7 +84,7 @@ func TestDefaultRule_ExistingBucketFollowsTheChange(t *testing.T) {
 
 	// Land a new snapshot carrying a DB default, as a reload would.
 	snap := s.rulesPtr.Load()
-	lp, ok := sanitizeParams(7, 21)
+	lp, ok := sanitizeParams(7, 21, DefaultMaxRuleRate, DefaultMaxRuleBurst)
 	require.True(t, ok)
 	newSnap := &rulesSnapshot{
 		byKey:    snap.byKey,
