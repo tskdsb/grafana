@@ -79,11 +79,11 @@ func TestDefaultRule_ExistingBucketFollowsTheChange(t *testing.T) {
 	s := newTestService(cfg)
 
 	// Create the bucket under the ini baseline.
-	e := s.getUserEntry("user:1", s.resolveRule("user:1"))
+	snap := s.rulesPtr.Load()
+	e := s.getUserEntry(snap, "user:1", s.resolveRuleIn(snap, "user:1"))
 	require.EqualValues(t, cfg.DefaultUserRate, int(e.limiter.Limit()))
 
 	// Land a new snapshot carrying a DB default, as a reload would.
-	snap := s.rulesPtr.Load()
 	lp, ok := sanitizeParams(7, 21, DefaultMaxRuleRate, DefaultMaxRuleBurst)
 	require.True(t, ok)
 	newSnap := &rulesSnapshot{
@@ -94,7 +94,7 @@ func TestDefaultRule_ExistingBucketFollowsTheChange(t *testing.T) {
 	}
 	s.rulesPtr.Store(newSnap)
 
-	e2 := s.getUserEntry("user:1", s.resolveRule("user:1"))
+	e2 := s.getUserEntry(newSnap, "user:1", s.resolveRuleIn(newSnap, "user:1"))
 	require.Same(t, e, e2, "same key must reuse the same entry")
 	require.EqualValues(t, 7, int(e2.limiter.Limit()),
 		"an existing bucket must follow the new default without waiting for eviction")

@@ -191,6 +191,38 @@ var (
 		Buckets: []float64{1, 2, 5, 10, 20, 30, 50, 100, 200, 500, 1000},
 	}, []string{"kind"})
 
+	metricIdentityTokens = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "grafana",
+		Subsystem: "datasource_ratelimit",
+		Name:      "identity_tokens_total",
+		Help: "Per-identity QPS demand and personal-limit decisions. Unit: tokens. " +
+			"result=\"demand\" counts every requested token that enters the token-bucket path; " +
+			"mode=blocked uses the allocation-free fast path and is excluded. " +
+			"result=\"limited\" counts tokens over the personal QPS bucket. enforced applies only to limited: " +
+			"false is a shadow projection, true was actually rejected.",
+	}, []string{"kind", "identity", "login", "result", "enforced"})
+
+	metricIdentityInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "grafana",
+		Subsystem: "datasource_ratelimit",
+		Name:      "identity_inflight",
+		Help:      "Current in-flight datasource queries for one user or service account.",
+	}, []string{"kind", "identity", "login"})
+
+	metricIdentityRateLimit = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "grafana",
+		Subsystem: "datasource_ratelimit",
+		Name:      "identity_rate_limit",
+		Help:      "Effective personal QPS token-rate limit for one user or service account; 0 means unlimited.",
+	}, []string{"kind", "identity", "login"})
+
+	metricIdentityConcurrencyLimit = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "grafana",
+		Subsystem: "datasource_ratelimit",
+		Name:      "identity_concurrency_limit",
+		Help:      "Effective personal in-flight limit for one user or service account; 0 means unlimited.",
+	}, []string{"kind", "identity", "login"})
+
 	// metricConcurrencyDenied counts requests the in-flight cap turned away.
 	//
 	// Separate from denied_total rather than another label on it: that counter
@@ -270,6 +302,10 @@ func init() {
 		metricLastReload,
 		metricOversizedBody,
 		metricUserRate,
+		metricIdentityTokens,
+		metricIdentityInflight,
+		metricIdentityRateLimit,
+		metricIdentityConcurrencyLimit,
 		metricConcurrencyDenied,
 		metricConcurrencyInflight,
 		metricConcurrencyHeld,

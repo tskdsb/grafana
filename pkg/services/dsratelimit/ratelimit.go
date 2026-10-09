@@ -107,6 +107,12 @@ type userEntry struct {
 	limiter          *rate.Limiter
 	lastUsedUnixNano atomic.Int64
 
+	// labels exists only for user and service-account entries. It binds the
+	// stable ID to the current login for identity-level Prometheus series.
+	metricMu sync.Mutex
+	labels   *identityMetricLabels
+	removed  bool
+
 	// Tokens charged to this identity since the last sample, drained by
 	// sampleUserRates. Feeds the per-identity QPS histogram, which is what
 	// default_user_rate is sized against: the aggregate counters carry only
@@ -470,10 +476,11 @@ const userRateSampleInterval = 10 * time.Second
 func (s *Service) sampleUserRates() {
 	secs := userRateSampleInterval.Seconds()
 	s.userBuckets.Range(func(k, v any) bool {
+		e := v.(*userEntry)
 		// Swap, so each token is observed in exactly one window, and a bucket
 		// that goes quiet contributes nothing rather than repeating its last
 		// value forever.
-		charged := v.(*userEntry).sinceSample.Swap(0)
+		charged := e.sinceSample.Swap(0)
 		if charged <= 0 {
 			return true
 		}
@@ -900,18 +907,20 @@ func sanitizeParams(rateVal, burstVal, maxRate, maxBurst int64) (laneParams, boo
 // getUserLimiter returns (creating if needed) the per-key *rate.Limiter.
 // Thin wrapper over getUserEntry for callers that do not need the entry.
 func (s *Service) getUserLimiter(key string, rule *Rule) *rate.Limiter {
-	return s.getUserEntry(key, rule).limiter
+	return s.getUserEntry(s.rulesPtr.Load(), key, rule).limiter
 }
 
 // getUserEntry returns (creating if needed) the per-key cache entry.
 // The rule's rate/burst is applied on every call so that admin-API updates
 // take effect on the next request without waiting for cache eviction.
+// The caller supplies the snapshot used to resolve rule so one request never
+// mixes a rule from one generation with defaults from another.
 //
 // Invalid stored values fall back to the configured defaults and are logged
 // rather than applied: see sanitizeParams for why applying them would be
 // worse than ignoring them.
-func (s *Service) getUserEntry(key string, rule *Rule) *userEntry {
-	baseRate, baseBurst := s.defaultParams(s.rulesPtr.Load())
+func (s *Service) getUserEntry(snap *rulesSnapshot, key string, rule *Rule) *userEntry {
+	baseRate, baseBurst := s.defaultParams(snap)
 	desiredRate := rate.Limit(baseRate)
 	desiredBurst := int(baseBurst)
 	if rule.Rate != nil && rule.Burst != nil {
@@ -1048,6 +1057,7 @@ func (s *Service) cleanup() {
 			}
 			if cur, present := s.userBuckets.Load(entries[i].key); present && cur == v {
 				s.userBuckets.Delete(entries[i].key)
+				ue.removeIdentitySeries()
 				s.userCount.Add(-1)
 			}
 			// No else branch. The entry is committed to removal at this point,

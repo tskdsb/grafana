@@ -347,7 +347,7 @@ func TestDenyAttribution_SaturatedDatasourceDoesNotBlameCaller(t *testing.T) {
 
 	// The identity bucket is the thing that must not erode: only the one
 	// request that actually reached the backend may be charged.
-	entry := s.getUserEntry("user:9", &Rule{})
+	entry := s.getUserEntry(s.rulesPtr.Load(), "user:9", &Rule{})
 	require.InDelta(t, float64(entry.limiter.Burst()-1),
 		entry.limiter.TokensAt(time.Now()), 0.5,
 		"exactly one token spent -- the request that was served")

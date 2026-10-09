@@ -80,7 +80,9 @@ func (s *Service) Middleware(c *contextmodel.ReqContext) {
 
 	// Fast path: blocked never constructs a rate.Limiter. The mode enum exists
 	// precisely to keep it out of x/time/rate's Limit==0 trap (rate.go:345-356
-	// would permanently drain burst).
+	// would permanently drain burst). Blocked traffic is intentionally absent
+	// from identity Top K: it allocates no cache entry, and keeping that property
+	// matters more than adding permanently rejected demand to sizing data.
 	switch Mode(rule.Mode) {
 	case ModeBlocked:
 		metricAttempted.WithLabelValues(dsLabel, kind).Add(1)
@@ -124,8 +126,12 @@ func (s *Service) Middleware(c *contextmodel.ReqContext) {
 		// short-circuits, so there is nothing to do here.
 	}
 
-	entry := s.getUserEntry(key, rule)
+	entry := s.getUserEntry(snap, key, rule)
 	userLim := entry.limiter
+	entry.withIdentityLabels(key, c.Login, func(labels *identityMetricLabels) {
+		metricIdentityRateLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityRateLimit(snap, rule, userLim))
+		metricIdentityConcurrencyLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityConcurrencyLimit(snap, key))
+	})
 	now := time.Now()
 
 	// Cost accounting: one token per backend request. A /api/ds/query body
@@ -158,6 +164,9 @@ func (s *Service) Middleware(c *contextmodel.ReqContext) {
 	// allowed half would make the metric agree with whatever limit is already
 	// configured and stop being evidence about it.
 	entry.sinceSample.Add(int64(n))
+	entry.withCurrentIdentityLabels(func(labels *identityMetricLabels) {
+		metricIdentityTokens.WithLabelValues(labels.kind, labels.identity, labels.login, "demand", "false").Add(float64(n))
+	})
 	if isDsQueryRoute(c) {
 		// Same demand semantics for burst sizing. In shadow mode an over-burst
 		// request is served, and it is exactly the sample the operator needs in
@@ -208,6 +217,9 @@ func (s *Service) Middleware(c *contextmodel.ReqContext) {
 	}
 	if outcome == outcomeDenied && denyReason == "user" {
 		dsLabel = dsLabelNone
+		entry.withCurrentIdentityLabels(func(labels *identityMetricLabels) {
+			metricIdentityTokens.WithLabelValues(labels.kind, labels.identity, labels.login, "limited", enforcedLabel(!shadow)).Add(float64(n))
+		})
 	} else if denyTarget != "" {
 		dsLabel = denyTarget
 	}

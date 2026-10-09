@@ -352,7 +352,12 @@ func (s *Service) ConcurrencyMiddleware(next http.Handler) http.Handler {
 		var entry *userEntry
 		var admitted bool
 		for attempt := 0; attempt < 3; attempt++ {
-			e := s.getUserEntry(key, s.resolveRuleIn(snap, key))
+			rule := s.resolveRuleIn(snap, key)
+			e := s.getUserEntry(snap, key, rule)
+			e.withIdentityLabels(key, c.Login, func(labels *identityMetricLabels) {
+				metricIdentityRateLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityRateLimit(snap, rule, e.limiter))
+				metricIdentityConcurrencyLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityConcurrencyLimit(snap, key))
+			})
 			got, ok := e.conc.acquire(effective)
 			if ok {
 				entry, admitted = e, got
@@ -372,6 +377,7 @@ func (s *Service) ConcurrencyMiddleware(next http.Handler) http.Handler {
 			if e.conc.claimRemoval() {
 				if cur, ok := s.userBuckets.Load(key); ok && cur == any(e) {
 					s.userBuckets.Delete(key)
+					e.removeIdentitySeries()
 					s.userCount.Add(-1)
 				}
 			}
@@ -398,6 +404,7 @@ func (s *Service) ConcurrencyMiddleware(next http.Handler) http.Handler {
 
 		defer func() {
 			entry.conc.release()
+			entry.publishIdentityInflight()
 			metricConcurrencyHeld.Dec()
 		}()
 		metricConcurrencyHeld.Inc()
@@ -405,6 +412,7 @@ func (s *Service) ConcurrencyMiddleware(next http.Handler) http.Handler {
 		// Observed after the slot is taken, so the value includes this request:
 		// the reading an operator compares against a candidate limit.
 		held := entry.conc.load()
+		entry.publishIdentityInflight()
 		metricConcurrencyInflight.WithLabelValues(keyKind(key)).Observe(float64(held))
 
 		// Shadow mode admits everything, so the refusal it would have made has
