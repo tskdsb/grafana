@@ -203,6 +203,16 @@ type Service struct {
 	// by the rule table (plus the single shared "anon:anon" key), not by
 	// traffic. It therefore needs no TTL eviction.
 	blockedLog sync.Map
+
+	// identityMetricMu serialises the lifecycle of the per-identity metric
+	// series: a request path publishing (or re-publishing) a series under
+	// e.metricMu, and an eviction deleting series under e.metricMu, can briefly
+	// own the same (kind,identity,login). Deletion is by label value, so the
+	// ownership check + delete must be atomic against the concurrent owner's
+	// first publish. There is deliberately a single lock (no per-key sharding):
+	// the path already serialises on e.metricMu, correctness first, shard only
+	// with perf evidence. Lock order is always identityMetricMu -> e.metricMu.
+	identityMetricMu sync.Mutex
 }
 
 // ProvideService is the wire provider. Fail-open at startup: if the initial
@@ -665,6 +675,7 @@ func (s *Service) reloadRules(ctx context.Context) error {
 	// resolved values after every atomic snapshot swap so the dashboard reads
 	// the same generation the request path does.
 	s.publishRuntimeConfig(snap)
+	s.republishIdentityGauges(snap)
 	// Snapshot freshness. fail_open_total counts reload failures, but a counter
 	// cannot say how stale the in-memory config is: after a failure the service
 	// keeps serving the previous snapshot indefinitely, so an admin API change
@@ -1057,7 +1068,7 @@ func (s *Service) cleanup() {
 			}
 			if cur, present := s.userBuckets.Load(entries[i].key); present && cur == v {
 				s.userBuckets.Delete(entries[i].key)
-				ue.removeIdentitySeries()
+				s.removeIdentitySeries(ue, entries[i].key.(string))
 				s.userCount.Add(-1)
 			}
 			// No else branch. The entry is committed to removal at this point,

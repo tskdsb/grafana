@@ -128,7 +128,7 @@ func (s *Service) Middleware(c *contextmodel.ReqContext) {
 
 	entry := s.getUserEntry(snap, key, rule)
 	userLim := entry.limiter
-	entry.withIdentityLabels(key, c.Login, func(labels *identityMetricLabels) {
+	s.withIdentityLabels(entry, key, c.Login, func(labels *identityMetricLabels) {
 		metricIdentityRateLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityRateLimit(snap, rule, userLim))
 		metricIdentityConcurrencyLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityConcurrencyLimit(snap, key))
 	})

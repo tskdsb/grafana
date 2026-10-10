@@ -354,7 +354,7 @@ func (s *Service) ConcurrencyMiddleware(next http.Handler) http.Handler {
 		for attempt := 0; attempt < 3; attempt++ {
 			rule := s.resolveRuleIn(snap, key)
 			e := s.getUserEntry(snap, key, rule)
-			e.withIdentityLabels(key, c.Login, func(labels *identityMetricLabels) {
+			s.withIdentityLabels(e, key, c.Login, func(labels *identityMetricLabels) {
 				metricIdentityRateLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityRateLimit(snap, rule, e.limiter))
 				metricIdentityConcurrencyLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityConcurrencyLimit(snap, key))
 			})
@@ -377,7 +377,7 @@ func (s *Service) ConcurrencyMiddleware(next http.Handler) http.Handler {
 			if e.conc.claimRemoval() {
 				if cur, ok := s.userBuckets.Load(key); ok && cur == any(e) {
 					s.userBuckets.Delete(key)
-					e.removeIdentitySeries()
+					s.removeIdentitySeries(e, key)
 					s.userCount.Add(-1)
 				}
 			}

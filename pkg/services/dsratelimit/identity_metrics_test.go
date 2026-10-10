@@ -109,7 +109,7 @@ func TestIdentityMetrics_LimitsShowUnlimitedWhenLayerInactive(t *testing.T) {
 	cfg.DefaultUserConcurrency = 5
 	s := newTestService(cfg)
 	entry := s.getUserEntry(s.rulesPtr.Load(), "user:8", s.resolveRuleIn(s.rulesPtr.Load(), "user:8"))
-	entry.withIdentityLabels("user:8", "bob", func(labels *identityMetricLabels) {
+	s.withIdentityLabels(entry, "user:8", "bob", func(labels *identityMetricLabels) {
 		metricIdentityRateLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityRateLimit(s.rulesPtr.Load(), s.resolveRuleIn(s.rulesPtr.Load(), "user:8"), entry.limiter))
 		metricIdentityConcurrencyLimit.WithLabelValues(labels.values()...).Set(s.effectiveIdentityConcurrencyLimit(s.rulesPtr.Load(), "user:8"))
 	})
@@ -125,13 +125,13 @@ func TestIdentityMetrics_CleanupRemovesAllLocalSeries(t *testing.T) {
 	s := newTestService(cfg)
 	first := s.getUserEntry(s.rulesPtr.Load(), "user:1", s.resolveRuleIn(s.rulesPtr.Load(), "user:1"))
 	first.lastUsedUnixNano.Store(1)
-	first.withIdentityLabels("user:1", "old", func(labels *identityMetricLabels) {
+	s.withIdentityLabels(first, "user:1", "old", func(labels *identityMetricLabels) {
 		metricIdentityInflight.WithLabelValues(labels.values()...).Set(0)
 		metricIdentityTokens.WithLabelValues(labels.kind, labels.identity, labels.login, "demand", "false").Add(3)
 	})
 	// Make the second entry newer, so cleanup evicts user:1.
 	second := s.getUserEntry(s.rulesPtr.Load(), "user:2", s.resolveRuleIn(s.rulesPtr.Load(), "user:2"))
-	second.withIdentityLabels("user:2", "new", func(labels *identityMetricLabels) {})
+	s.withIdentityLabels(second, "user:2", "new", func(labels *identityMetricLabels) {})
 	s.cleanup()
 
 	require.False(t, metricHasIdentity(t, metricIdentityInflight, "1", "old"),
