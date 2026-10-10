@@ -196,3 +196,103 @@ func concRequestForUser(s *Service, path string, u *user.SignedInUser, handler h
 	s.ConcurrencyMiddleware(handler).ServeHTTP(w, r)
 	return w
 }
+
+// TestReloadGaugeRefreshNoTraffic pins the no-traffic hot-reload observability
+// fix: identity_rate_limit / identity_concurrency_limit are otherwise only
+// written on the request path, so an admin PUT leaves them stale until the next
+// query. After reloadRules republishes them from the new snapshot, idle gauges
+// must refresh across default, per-identity override, invalid-fallback and
+// null-concurrency-fallback cases. No limiter decision is touched.
+func TestReloadGaugeRefreshNoTraffic(t *testing.T) {
+	freshIdentityMetrics(t)
+	cfg := defaultCfg()
+	cfg.DefaultUserRate, cfg.DefaultUserBurst = 20, 40
+	cfg.ConcurrencyEnabled = true
+	cfg.DefaultUserConcurrency = 5
+	s := newTestService(cfg)
+
+	e := s.getUserEntry(s.rulesPtr.Load(), "user:42", s.resolveRuleIn(s.rulesPtr.Load(), "user:42"))
+	s.withIdentityLabels(e, "user:42", "alice", func(l *identityMetricLabels) {
+		metricIdentityRateLimit.WithLabelValues(l.values()...).Set(s.effectiveIdentityRateLimit(s.rulesPtr.Load(), s.resolveRuleIn(s.rulesPtr.Load(), "user:42"), e.limiter))
+		metricIdentityConcurrencyLimit.WithLabelValues(l.values()...).Set(s.effectiveIdentityConcurrencyLimit(s.rulesPtr.Load(), "user:42"))
+	})
+	require.Equal(t, float64(20), identityGaugeValue(t, metricIdentityRateLimit, "user", "42", "alice"))
+
+	rate7, burst10, conc3 := int64(7), int64(10), int64(3)
+	badRate := int64(cfg.MaxRuleRate + 1)
+	cases := []struct {
+		name     string
+		snap     *rulesSnapshot
+		wantQPS float64
+		wantConc float64
+	}{
+		{"override", &rulesSnapshot{byKey: map[string]*Rule{"user:42": {Kind: "user", Target: "42", Mode: "limited", Rate: &rate7, Burst: &burst10, Concurrency: &conc3}}}, 7, 3},
+		{"invalid-rate-fallback", &rulesSnapshot{byKey: map[string]*Rule{"user:42": {Kind: "user", Target: "42", Mode: "limited", Rate: &badRate}}}, 20, 5},
+		{"no-override-default", &rulesSnapshot{byKey: map[string]*Rule{}}, 20, 5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s.rulesPtr.Store(tc.snap)
+			s.republishIdentityGauges(tc.snap)
+			require.Equal(t, tc.wantQPS, identityGaugeValue(t, metricIdentityRateLimit, "user", "42", "alice"))
+			require.Equal(t, tc.wantConc, identityGaugeValue(t, metricIdentityConcurrencyLimit, "user", "42", "alice"))
+		})
+	}
+}
+
+// TestEvictionPreservesNewOwnerSeries pins the R1 eviction ownership fix: when
+// cleanup removes a stale entry but a fresh request has already re-created the
+// key, the stale entry must not DeleteLabelValues the new owner's live series.
+// The interleaving is driven deterministically through identityMetricMu (no
+// sleeps): the eviction goroutine blocks on the global lock while the test
+// inserts+emits the new owner's counter and inflight gauge.
+func TestEvictionPreservesNewOwnerSeries(t *testing.T) {
+	freshIdentityMetrics(t)
+	s := newTestService(defaultCfg())
+
+	a := s.getUserEntry(s.rulesPtr.Load(), "user:7", s.resolveRuleIn(s.rulesPtr.Load(), "user:7"))
+	s.withIdentityLabels(a, "user:7", "alice", func(l *identityMetricLabels) {
+		metricIdentityTokens.WithLabelValues(l.kind, l.identity, l.login, "demand", "false").Add(100)
+	})
+
+	s.identityMetricMu.Lock()
+	s.userBuckets.Delete("user:7")
+	done := make(chan struct{})
+	go func() { s.removeIdentitySeries(a, "user:7"); close(done) }()
+	b := s.getUserEntry(s.rulesPtr.Load(), "user:7", s.resolveRuleIn(s.rulesPtr.Load(), "user:7"))
+	b.metricMu.Lock()
+	b.labels = &identityMetricLabels{kind: "user", identity: "7", login: "alice"}
+	metricIdentityTokens.WithLabelValues("user", "7", "alice", "demand", "false").Add(3)
+	metricIdentityInflight.WithLabelValues("user", "7", "alice").Set(4)
+	b.metricMu.Unlock()
+	s.identityMetricMu.Unlock()
+	<-done
+
+	require.True(t, a.removed)
+	require.Equal(t, float64(103), counterValue(t, metricIdentityTokens, "user", "7", "alice", "demand", "false"),
+		"new owner counter survives (no reset/wipe)")
+	require.Equal(t, float64(4), identityGaugeValue(t, metricIdentityInflight, "user", "7", "alice"),
+		"new owner inflight gauge survives")
+}
+
+// TestConcurrency_PanicDownstreamReleasesSlotThenAdmitsNext pins the concurrency
+// defer-release: a downstream panic unwinds through the middleware, so the
+// deferred release must still return the slot (inflight back to 0) and the very
+// next request must be admitted. The middleware does not itself recover -- the
+// panic propagates to Grafana's HTTP recovery layer -- so the test recovers.
+func TestConcurrency_PanicDownstreamReleasesSlotThenAdmitsNext(t *testing.T) {
+	freshIdentityMetrics(t)
+	s := newTestService(concCfg(1))
+	u := &user.SignedInUser{UserID: 8, Login: "panicuser"}
+
+	panicking := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { panic("boom") })
+	require.Panics(t, func() { concRequestForUser(s, "/api/ds/query", u, panicking) })
+	require.Equal(t, float64(0), identityGaugeValue(t, metricIdentityInflight, "user", "8", "panicuser"),
+		"deferred release must run despite the downstream panic")
+
+	// Slot freed: a normal request is admitted and runs to completion.
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	r := concRequestForUser(s, "/api/ds/query", u, ok)
+	require.Equal(t, http.StatusOK, r.Code)
+	require.Equal(t, float64(0), identityGaugeValue(t, metricIdentityInflight, "user", "8", "panicuser"))
+}
