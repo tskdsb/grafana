@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 
 	"github.com/grafana/grafana/pkg/services/user"
 )
@@ -686,6 +687,27 @@ func TestB20_R1_EvictionInterleaveKeepsNewOwnerInflightGauge(t *testing.T) {
 
 	require.Equal(t, float64(4), identityGaugeValue(t, metricIdentityInflight, "user", "9", "carol"),
 		"new owner B's inflight gauge must survive A's eviction (shared labels, not deleted)")
+}
+
+// TestB21_HotBurstIncreaseDoesNotTopUpDrainedBucket pins the x/time/rate
+// contract our reload relies on (observed on the old HTTP image: after raising
+// burst 1->5 the very next request was still 429). SetBurst advances tokens
+// against the OLD burst cap and then raises burst; it does NOT refill the
+// bucket. A drained limiter stays drained until time refills tokens at `rate`.
+// This is expected semantics, not a reload bug.
+func TestB21_HotBurstIncreaseDoesNotTopUpDrainedBucket(t *testing.T) {
+	lim := rate.NewLimiter(1, 1) // 1 token/sec, burst 1
+	now := time.Now()
+	require.True(t, lim.AllowN(now, 1), "first request consumes the only token")
+	require.False(t, lim.AllowN(now, 1), "bucket drained")
+
+	lim.SetBurst(5) // raise burst hot; does NOT grant the extra 4 tokens
+	require.Equal(t, 5, lim.Burst())
+	require.False(t, lim.AllowN(now, 1), "immediately after raising burst: still no free token")
+
+	// After refill the new capacity accrues at 1/sec (not instantly 5).
+	later := now.Add(1500 * time.Millisecond)
+	require.True(t, lim.AllowN(later, 1), "one token refilled after ~1.5s")
 }
 
 func itoa(i int64) string {
